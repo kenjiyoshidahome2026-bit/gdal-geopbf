@@ -8,15 +8,41 @@
 OGRGeoPBFDataset::OGRGeoPBFDataset() {}
 OGRGeoPBFDataset::~OGRGeoPBFDataset() { delete m_poLayer; }
 
+// ファイル全体をメモリへ。サイズを先に問い合わせず逐次読みにするのは、/vsigzip/ のように
+// 「開く前に伸長後サイズが判らない」ハンドルでも同じ経路で読めるようにするため。
+static bool GeoPBFIngest(VSILFILE* fp, std::vector<uint8_t>& out) {
+    constexpr size_t CHUNK = 1 << 20;
+    size_t n = 0;
+    for (;;) {
+        out.resize(n + CHUNK);
+        const size_t got = VSIFReadL(out.data() + n, 1, CHUNK, fp);
+        n += got;
+        if (got < CHUNK) break;
+    }
+    out.resize(n);
+    return n > 0;
+}
+
 int OGRGeoPBFDataset::Open(const char* pszFilename) {
-    VSILFILE* fp = VSIFOpenL(pszFilename, "rb");
+    // gzip された .geopbf を透過的に読む。ウェブ側の書き出し（encoder）は gzip して .geopbf を吐き、
+    // JS の読み手は gzip 印を見て自動で伸長する＝同じ物がドライバでも開けないと片翼になる。
+    // 実装は GDAL の /vsigzip/ に委譲（自前 zlib を持たない＝依存ゼロの掟を守る）。
+    std::string osOpen(pszFilename);
+    {
+        VSILFILE* fpProbe = VSIFOpenL(pszFilename, "rb");
+        if (!fpProbe) return FALSE;
+        unsigned char magic[2] = {0, 0};
+        const size_t got = VSIFReadL(magic, 1, 2, fpProbe);
+        VSIFCloseL(fpProbe);
+        const bool bAlreadyVsi = osOpen.compare(0, 9, "/vsigzip/") == 0;
+        if (got == 2 && magic[0] == 0x1F && magic[1] == 0x8B && !bAlreadyVsi)
+            osOpen = "/vsigzip/" + osOpen;
+    }
+    VSILFILE* fp = VSIFOpenL(osOpen.c_str(), "rb");
     if (!fp) return FALSE;
-    VSIFSeekL(fp, 0, SEEK_END);
-    vsi_l_offset size = VSIFTellL(fp);
-    VSIFSeekL(fp, 0, SEEK_SET);
-    m_data.resize((size_t)size);
-    VSIFReadL(m_data.data(), 1, (size_t)size, fp);
+    const bool bIngested = GeoPBFIngest(fp, m_data);
     VSIFCloseL(fp);
+    if (!bIngested) return FALSE;
 
     PbfReader r(m_data.data(), 0, m_data.size());
     while (!r.atEnd()) {
@@ -283,11 +309,29 @@ OGRGeometry* OGRGeoPBFLayer::DecodeGeometry(PbfReader& r) {
 
 // ── Driver registration ───────────────────────────────────────────────────────
 
-static GDALDataset* OGRGeoPBFDriverOpen(GDALOpenInfo* poOpenInfo) {
-    if (poOpenInfo->eAccess == GA_Update) return nullptr;
-    const char* ext = CPLGetExtension(poOpenInfo->pszFilename);
-    if (!EQUAL(ext, "geopbf")) return nullptr;
+// 先頭バイトが GeoPBF ヘッダらしいか（tag 1 = NAME・wire type 2 → 0x0A、続いて名前長と名前）。
+// 拡張子だけの判定では /vsigzip/ 経由や別名のファイルを取りこぼすため、GDAL の作法どおり署名を見る。
+static int GeoPBFLooksLikeHeader(const GByte* p, int n) {
+    if (n < 3 || p[0] != 0x0A) return FALSE;
+    const int len = p[1];                        // 名前長（1バイト varint ＝ 127 まで）
+    if (len < 1 || len > 100 || 2 + len > n) return FALSE;
+    for (int i = 0; i < len; i++)
+        if (p[2 + i] < 0x20) return FALSE;       // 制御文字は名前に来ない（UTF-8 の日本語は 0x80 以上＝許容）
+    return TRUE;
+}
 
+static int OGRGeoPBFDriverIdentify(GDALOpenInfo* poOpenInfo) {
+    if (poOpenInfo->eAccess == GA_Update) return FALSE;
+    const int bExt = EQUAL(CPLGetExtension(poOpenInfo->pszFilename), "geopbf");
+    const GByte* h = poOpenInfo->pabyHeader;
+    const int n = poOpenInfo->nHeaderBytes;
+    if (n >= 2 && h[0] == 0x1F && h[1] == 0x8B) return bExt;   // gzip＝中身を覗けない＝拡張子で裁く
+    if (GeoPBFLooksLikeHeader(h, n)) return TRUE;              // 素の PBF＝名前が .geopbf でなくても開く
+    return bExt;                                               // 署名が読めない時は従来どおり拡張子（Open が最終判定）
+}
+
+static GDALDataset* OGRGeoPBFDriverOpen(GDALOpenInfo* poOpenInfo) {
+    if (!OGRGeoPBFDriverIdentify(poOpenInfo)) return nullptr;
     auto* poDS = new OGRGeoPBFDataset();
     if (!poDS->Open(poOpenInfo->pszFilename)) { delete poDS; return nullptr; }
     return poDS;
@@ -302,6 +346,7 @@ void CPL_DLL GDALRegister_GeoPBF() {
     d->SetMetadataItem(GDAL_DMD_LONGNAME,    "GeoPBF Vector Format");
     d->SetMetadataItem(GDAL_DMD_EXTENSION,   "geopbf");
     d->SetMetadataItem(GDAL_DCAP_VIRTUALIO,  "YES");
+    d->pfnIdentify = OGRGeoPBFDriverIdentify;   // Identify は Open より先に呼ばれる＝他形式のファイルを掴まない
     d->pfnOpen = OGRGeoPBFDriverOpen;
     GetGDALDriverManager()->RegisterDriver(d);
 }

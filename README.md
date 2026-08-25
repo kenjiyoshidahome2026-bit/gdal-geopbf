@@ -7,6 +7,8 @@ GeoPBF is a compact binary vector format based on Protocol Buffers with delta-en
 ## Features
 
 - Read `.geopbf` files via any GDAL-based tool (`ogrinfo`, `ogr2ogr`, QGIS, PostGIS, ...)
+- **Gzipped `.geopbf` is read transparently** — files exported from web tooling are gzip-compressed; the driver detects the gzip signature and reads them through GDAL's `/vsigzip/` (no zlib dependency added)
+- **Content-based `Identify()`** — files are recognised by their header signature, not only by the `.geopbf` extension
 - Zero external dependencies — self-contained Protobuf reader included
 - Supports all GeoPBF geometry types: Point, MultiPoint, LineString, MultiLineString, Polygon, MultiPolygon, GeometryCollection
 - WGS84 (EPSG:4326) spatial reference
