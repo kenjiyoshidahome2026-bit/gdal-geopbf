@@ -11,16 +11,24 @@ OGRGeoPBFDataset::~OGRGeoPBFDataset() { delete m_poLayer; }
 
 // ファイル全体をメモリへ。サイズを先に問い合わせず逐次読みにするのは、/vsigzip/ のように
 // 「開く前に伸長後サイズが判らない」ハンドルでも同じ経路で読めるようにするため。
-static bool GeoPBFIngest(VSILFILE* fp, std::vector<uint8_t>& out) {
-    constexpr size_t CHUNK = 1 << 20;
+// ファイル全体をメモリへ。nHint＝展開後の大きさの見込み（0＝不明）。
+// 見込みが当たれば確保も読みも一回で済む。外れても正しく読めるよう、足りなければ伸ばす。
+// ※ここを刻んで伸ばすと再確保の山で実メモリが数倍に膨らむ（gzip 35MB／展開159MB のファイルで
+//   ピーク 700MB を踏んだ）。大きさを先に知ることが唯一効く対策。
+static bool GeoPBFIngest(VSILFILE* fp, std::vector<uint8_t>& out, vsi_l_offset nHint) {
+    constexpr size_t CHUNK = 4 << 20;
     size_t n = 0;
+    // 見込み +1 バイト。ぴったり確保すると「読み切ったのに EOF が確定しない」ため、
+    // 確かめるためだけにもう一段伸ばす＝再確保とコピーで実メモリが 2.5 倍になる。
+    if (nHint > 0 && nHint < (vsi_l_offset)(1ULL << 40)) out.resize((size_t)nHint + 1);
     for (;;) {
-        out.resize(n + CHUNK);
-        const size_t got = VSIFReadL(out.data() + n, 1, CHUNK, fp);
+        if (out.size() == n) out.resize(std::max(n + CHUNK, out.size() + out.size() / 2));
+        const size_t want = out.size() - n;
+        const size_t got = VSIFReadL(out.data() + n, 1, want, fp);
         n += got;
-        if (got < CHUNK) break;
+        if (got < want) break;            // 要求より少ない＝末尾に達した
     }
-    out.resize(n);
+    if (out.size() != n) out.resize(n);
     return n > 0;
 }
 
@@ -29,19 +37,36 @@ int OGRGeoPBFDataset::Open(const char* pszFilename) {
     // JS の読み手は gzip 印を見て自動で伸長する＝同じ物がドライバでも開けないと片翼になる。
     // 実装は GDAL の /vsigzip/ に委譲（自前 zlib を持たない＝依存ゼロの掟を守る）。
     std::string osOpen(pszFilename);
+    vsi_l_offset nHint = 0;
     {
         VSILFILE* fpProbe = VSIFOpenL(pszFilename, "rb");
         if (!fpProbe) return FALSE;
         unsigned char magic[2] = {0, 0};
         const size_t got = VSIFReadL(magic, 1, 2, fpProbe);
+        const bool bGzip = (got == 2 && magic[0] == 0x1F && magic[1] == 0x8B);
+        if (bGzip) {
+            // gzip の末尾4バイト(ISIZE)＝展開後の大きさ（2^32 で巡回）。展開せずに判る唯一の手がかり。
+            unsigned char isize[4] = {0, 0, 0, 0};
+            if (VSIFSeekL(fpProbe, 0, SEEK_END) == 0) {
+                const vsi_l_offset nComp = VSIFTellL(fpProbe);
+                if (nComp >= 4 && VSIFSeekL(fpProbe, nComp - 4, SEEK_SET) == 0 &&
+                    VSIFReadL(isize, 1, 4, fpProbe) == 4) {
+                    const uint32_t u = (uint32_t)isize[0] | ((uint32_t)isize[1] << 8) |
+                                       ((uint32_t)isize[2] << 16) | ((uint32_t)isize[3] << 24);
+                    if (u >= nComp) nHint = u;   // 4GB 超は巡回して当てにならない＝見込み無しで進む
+                }
+            }
+        } else {
+            VSIStatBufL st;
+            if (VSIStatL(pszFilename, &st) == 0 && st.st_size > 0) nHint = (vsi_l_offset)st.st_size;
+        }
         VSIFCloseL(fpProbe);
         const bool bAlreadyVsi = osOpen.compare(0, 9, "/vsigzip/") == 0;
-        if (got == 2 && magic[0] == 0x1F && magic[1] == 0x8B && !bAlreadyVsi)
-            osOpen = "/vsigzip/" + osOpen;
+        if (bGzip && !bAlreadyVsi) osOpen = "/vsigzip/" + osOpen;
     }
     VSILFILE* fp = VSIFOpenL(osOpen.c_str(), "rb");
     if (!fp) return FALSE;
-    const bool bIngested = GeoPBFIngest(fp, m_data);
+    const bool bIngested = GeoPBFIngest(fp, m_data, nHint);
     VSIFCloseL(fp);
     if (!bIngested) return FALSE;
 
@@ -67,6 +92,8 @@ int OGRGeoPBFDataset::Open(const char* pszFilename) {
             r.skipField(wt);
         }
     }
+    CPLDebug("GeoPBF", "%.1f MB in memory, %zu keys%s", m_data.size() / 1e6, m_keys.size(),
+             osOpen != pszFilename ? " (gzip)" : "");
     if (!m_farrayPos) return FALSE;
     SetDescription(pszFilename);
     m_poLayer = new OGRGeoPBFLayer(this);

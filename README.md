@@ -7,7 +7,7 @@ GeoPBF is a compact binary vector format based on Protocol Buffers with delta-en
 ## Features
 
 - Read **and write** `.geopbf` via any GDAL-based tool (`ogrinfo`, `ogr2ogr`, QGIS, PostGIS, ...)
-- **Gzipped `.geopbf` is read transparently** — files exported from web tooling are gzip-compressed; the driver detects the gzip signature and reads them through GDAL's `/vsigzip/` (no zlib dependency added)
+- **Gzipped `.geopbf` is read transparently** (memory use follows the decompressed size) — files exported from web tooling are gzip-compressed; the driver detects the gzip signature and reads them through GDAL's `/vsigzip/` (no zlib dependency added)
 - **Content-based `Identify()`** — files are recognised by their header signature, not only by the `.geopbf` extension
 - Zero external dependencies — self-contained Protobuf reader and writer
 - In-memory spatial index built on demand: window queries stay fast on large

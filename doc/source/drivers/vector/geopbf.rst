@@ -159,7 +159,9 @@ Limitations
 -  Two dimensions only; Z and M values are not stored.
 -  WGS 84 only.
 -  No update mode: existing files can be read or overwritten, not edited.
--  The whole file is read into memory when opened, and written features are
+-  The whole file is read into memory when opened — for a gzip-compressed file
+   that means the *decompressed* size, which can be several times the size on
+   disk. Written features are
    held in memory until the dataset is closed, because the attribute-name
    dictionary is only complete once every feature has been seen. The optional
    in-memory index adds about 32 bytes per feature on top of that.
