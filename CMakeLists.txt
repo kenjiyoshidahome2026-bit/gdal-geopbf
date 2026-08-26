@@ -4,7 +4,7 @@ set(CMAKE_CXX_STANDARD 17)
 
 find_package(GDAL REQUIRED)
 
-add_library(gdal_GeoPBF MODULE ogrgeopbf.cpp)
+add_library(gdal_GeoPBF MODULE ogrgeopbf.cpp ogrgeopbfwrite.cpp)
 target_include_directories(gdal_GeoPBF PRIVATE ${GDAL_INCLUDE_DIRS})
 target_link_libraries(gdal_GeoPBF PRIVATE GDAL::GDAL)
 

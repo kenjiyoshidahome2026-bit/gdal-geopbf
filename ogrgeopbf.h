@@ -69,6 +69,42 @@ struct PbfReader {
     }
 };
 
+// ── Minimal Protobuf writer ───────────────────────────────────────────────────
+// PbfReader と対称。依存ゼロを守るため protobuf ライブラリは使わない（形式が小さいので手書きで足りる）。
+
+struct PbfWriter {
+    std::vector<uint8_t> buf;
+
+    void raw(const uint8_t* p, size_t n) { buf.insert(buf.end(), p, p + n); }
+    void varint(uint64_t v) {
+        while (v >= 0x80) { buf.push_back((uint8_t)(v | 0x80)); v >>= 7; }
+        buf.push_back((uint8_t)v);
+    }
+    static uint64_t zigzag(int64_t v) { return ((uint64_t)v << 1) ^ (uint64_t)(v >> 63); }
+    void svarint(int64_t v) { varint(zigzag(v)); }
+    void tag(int field, int wire_type) { varint(((uint64_t)field << 3) | (uint64_t)wire_type); }
+
+    void varintField(int f, uint64_t v)  { tag(f, 0); varint(v); }
+    void svarintField(int f, int64_t v)  { tag(f, 0); svarint(v); }
+    void doubleField(int f, double d) {
+        tag(f, 1);
+        double t = d; CPL_LSBPTR64(&t);            // protobuf は常にリトルエンディアン
+        uint8_t b[8]; memcpy(b, &t, 8); raw(b, 8);
+    }
+    void stringField(int f, const std::string& s) {
+        tag(f, 2); varint(s.size()); raw((const uint8_t*)s.data(), s.size());
+    }
+    void bytesField(int f, const std::vector<uint8_t>& b) {
+        tag(f, 2); varint(b.size()); raw(b.data(), b.size());
+    }
+    void packedVarintField(int f, const std::vector<uint64_t>& v) {
+        PbfWriter t; for (uint64_t x : v) t.varint(x); bytesField(f, t.buf);
+    }
+    void packedSVarintField(int f, const std::vector<int64_t>& v) {
+        PbfWriter t; for (int64_t x : v) t.svarint(x); bytesField(f, t.buf);
+    }
+};
+
 // ── geopbf format constants ───────────────────────────────────────────────────
 
 enum { TAG_NAME=1, TAG_KEYS=2, TAG_PRECISION=3, TAG_BUFS=4,
@@ -122,4 +158,59 @@ private:
 
     OGRGeometry* DecodeGeometry(PbfReader& r);
     std::string  DecodeValue(PbfReader& r);
+};
+
+// ── Write side ────────────────────────────────────────────────────────────────
+// 単層フォーマット＝1データセット1レイヤ。地物は逐次エンコードしてメモリに積み、
+// Close()/デストラクタで「ヘッダ → FARRAY」を一括で書き出す（KEYS 辞書が全地物を見終わるまで確定しないため）。
+
+GDALDataset* OGRGeoPBFDriverCreate(const char* pszName, int, int, int, GDALDataType, CSLConstList);
+
+class OGRGeoPBFWriteLayer final : public OGRLayer {
+public:
+    OGRGeoPBFWriteLayer(const char* pszName, const OGRSpatialReference* poSRS,
+                        OGRwkbGeometryType eGType, double dfScale);
+    ~OGRGeoPBFWriteLayer();
+
+    const OGRFeatureDefn* GetLayerDefn() const override { return m_poFeatureDefn; }
+    void        ResetReading() override {}
+    OGRFeature* GetNextFeature() override { return nullptr; }
+    int         TestCapability(const char* pszCap) const override;
+    OGRErr      CreateField(const OGRFieldDefn* poField, int bApproxOK = TRUE) override;
+    OGRErr      ICreateFeature(OGRFeature* poFeature) override;
+
+    const std::vector<std::string>&          Keys()     const { return m_keys; }
+    const std::vector<std::vector<uint8_t>>& Features() const { return m_features; }
+
+private:
+    OGRFeatureDefn*                   m_poFeatureDefn;
+    std::vector<std::string>          m_keys;        // = ヘッダの KEYS（フィールド名辞書）
+    std::vector<std::vector<uint8_t>> m_features;    // 各要素＝FEATURE メッセージの中身
+    double                            m_dfScale;
+    bool                              m_bWarnedZ = false;   // Z は形式に無い＝一度だけ警告
+
+    void EncodeGeometry(const OGRGeometry* poGeom, PbfWriter& w);   // GEOMETRY メッセージの中身を書く
+};
+
+class OGRGeoPBFWriteDataset final : public GDALDataset {
+public:
+    OGRGeoPBFWriteDataset(const char* pszFilename, double dfScale);
+    ~OGRGeoPBFWriteDataset() override;
+
+    int              GetLayerCount() const override { return m_poLayer ? 1 : 0; }
+    const OGRLayer*  GetLayer(int i) const override;
+    int              TestCapability(const char* pszCap) const override;
+    CPLErr           Close(GDALProgressFunc pfnProgress = nullptr, void* pProgressData = nullptr) override;
+
+protected:
+    OGRLayer* ICreateLayer(const char* pszName, const OGRGeomFieldDefn* poGeomFieldDefn,
+                           CSLConstList papszOptions) override;
+
+private:
+    std::string           m_osFilename;
+    double                m_dfScale;
+    OGRGeoPBFWriteLayer*  m_poLayer = nullptr;
+    bool                  m_bWritten = false;
+
+    OGRErr WriteFile();
 };

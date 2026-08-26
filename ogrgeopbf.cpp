@@ -346,8 +346,20 @@ void CPL_DLL GDALRegister_GeoPBF() {
     d->SetMetadataItem(GDAL_DMD_LONGNAME,    "GeoPBF Vector Format");
     d->SetMetadataItem(GDAL_DMD_EXTENSION,   "geopbf");
     d->SetMetadataItem(GDAL_DCAP_VIRTUALIO,  "YES");
+    d->SetMetadataItem(GDAL_DCAP_CREATE_LAYER, "YES");
+    d->SetMetadataItem(GDAL_DCAP_CREATE_FIELD, "YES");
+    d->SetMetadataItem(GDAL_DMD_CREATIONFIELDDATATYPES,
+                       "Integer Integer64 Real String Date DateTime "
+                       "IntegerList Integer64List RealList StringList");
+    d->SetMetadataItem(GDAL_DMD_CREATIONFIELDDATASUBTYPES, "Boolean");
+    d->SetMetadataItem(GDAL_DMD_CREATIONOPTIONLIST,
+        "<CreationOptionList>"
+        "  <Option name='PRECISION' type='int' min='0' max='9' default='6' "
+        "description='Decimal digits kept in the integer-scaled coordinates (10^n)'/>"
+        "</CreationOptionList>");
     d->pfnIdentify = OGRGeoPBFDriverIdentify;   // Identify は Open より先に呼ばれる＝他形式のファイルを掴まない
     d->pfnOpen = OGRGeoPBFDriverOpen;
+    d->pfnCreate = OGRGeoPBFDriverCreate;
     GetGDALDriverManager()->RegisterDriver(d);
 }
 CPL_C_END
