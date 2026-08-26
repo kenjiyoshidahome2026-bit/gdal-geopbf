@@ -278,8 +278,8 @@ OGRErr OGRGeoPBFWriteLayer::ICreateFeature(OGRFeature* poFeature) {
 
 // ── Dataset ───────────────────────────────────────────────────────────────────
 
-OGRGeoPBFWriteDataset::OGRGeoPBFWriteDataset(const char* pszFilename, double dfScale)
-    : m_osFilename(pszFilename), m_dfScale(dfScale)
+OGRGeoPBFWriteDataset::OGRGeoPBFWriteDataset(const char* pszFilename, double dfScale, bool bGzip)
+    : m_osFilename(pszFilename), m_dfScale(dfScale), m_bGzip(bGzip)
 {
     SetDescription(pszFilename);
 }
@@ -327,7 +327,10 @@ OGRErr OGRGeoPBFWriteDataset::WriteFile() {
         for (const std::vector<uint8_t>& f : m_poLayer->Features()) farray.bytesField(TAG_FEATURE, f);
     out.bytesField(TAG_FARRAY, farray.buf);
 
-    VSILFILE* fp = VSIFOpenL(m_osFilename.c_str(), "wb");
+    // COMPRESS=GZIP＝GDAL の /vsigzip/ へ書く（自前 zlib を持たない＝依存ゼロを維持）。
+    // 読み手は gzip 印を見て透過的に開くので、拡張子は .geopbf のままでよい。
+    const std::string osOut = m_bGzip ? "/vsigzip/" + m_osFilename : m_osFilename;
+    VSILFILE* fp = VSIFOpenL(osOut.c_str(), "wb");
     if (!fp) {
         CPLError(CE_Failure, CPLE_OpenFailed, "GeoPBF: cannot create %s", m_osFilename.c_str());
         return OGRERR_FAILURE;
@@ -359,5 +362,10 @@ GDALDataset* OGRGeoPBFDriverCreate(const char* pszName, int, int, int, GDALDataT
         CPLError(CE_Failure, CPLE_IllegalArg, "GeoPBF: PRECISION must be between 0 and 9.");
         return nullptr;
     }
-    return new OGRGeoPBFWriteDataset(pszName, std::pow(10.0, nPrecision));
+    const char* pszCompress = CSLFetchNameValueDef(papszOptions, "COMPRESS", "NONE");
+    if (!EQUAL(pszCompress, "NONE") && !EQUAL(pszCompress, "GZIP")) {
+        CPLError(CE_Failure, CPLE_IllegalArg, "GeoPBF: COMPRESS must be NONE or GZIP.");
+        return nullptr;
+    }
+    return new OGRGeoPBFWriteDataset(pszName, std::pow(10.0, nPrecision), EQUAL(pszCompress, "GZIP"));
 }

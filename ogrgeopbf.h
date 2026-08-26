@@ -237,7 +237,7 @@ private:
 
 class OGRGeoPBFWriteDataset final : public GDALDataset {
 public:
-    OGRGeoPBFWriteDataset(const char* pszFilename, double dfScale);
+    OGRGeoPBFWriteDataset(const char* pszFilename, double dfScale, bool bGzip);
     ~OGRGeoPBFWriteDataset() override;
 
     int              GetLayerCount() const override { return m_poLayer ? 1 : 0; }
@@ -252,6 +252,7 @@ protected:
 private:
     std::string           m_osFilename;
     double                m_dfScale;
+    bool                  m_bGzip;      // 配布形は gzip 済みが通例＝読みと対称に書けるようにする
     OGRGeoPBFWriteLayer*  m_poLayer = nullptr;
     bool                  m_bWritten = false;
 

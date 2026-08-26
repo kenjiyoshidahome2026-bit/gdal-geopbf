@@ -55,6 +55,7 @@ ogr2ogr -f GPKG out.gpkg sample.geopbf
 # write
 ogr2ogr -f GeoPBF out.geopbf input.gpkg
 ogr2ogr -f GeoPBF -dsco PRECISION=7 out.geopbf input.geojson
+ogr2ogr -f GeoPBF -dsco COMPRESS=GZIP out.geopbf input.gpkg   # 配布形と同じ gzip 済み
 ```
 
 ## Without installing (development)
