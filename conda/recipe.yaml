@@ -1,0 +1,72 @@
+# conda-forge recipe (v1 format — required for new recipes since 2025; v0 meta.yaml is deprecated).
+#
+# Submit by copying this directory to conda-forge/staged-recipes as
+# recipes/libgdal-geopbf/, then opening a pull request.
+#
+# Before submitting:
+#   1. Tag and publish a release, e.g.  git tag v0.2.0 && git push --tags
+#   2. Fill in the sha256 below:
+#        curl -sL https://github.com/kenjiyoshidahome2026-bit/gdal-geopbf/archive/refs/tags/v0.2.0.tar.gz | shasum -a 256
+#   3. Replace the recipe-maintainers entry with the real GitHub handle.
+#   4. Confirm whether GDAL headers come from `libgdal-core` alone on the current
+#      conda-forge build; if a separate devel package has appeared, add it to `host`.
+
+context:
+  name: libgdal-geopbf
+  version: "0.2.0"
+
+package:
+  name: ${{ name }}
+  version: ${{ version }}
+
+source:
+  url: https://github.com/kenjiyoshidahome2026-bit/gdal-geopbf/archive/refs/tags/v${{ version }}.tar.gz
+  sha256: 0000000000000000000000000000000000000000000000000000000000000000
+
+build:
+  number: 0
+
+requirements:
+  build:
+    - ${{ compiler('cxx') }}
+    - ${{ stdlib('c') }}
+    - cmake
+    - ninja
+    - if: unix
+      then: make
+  host:
+    # libgdal-core carries the library and headers; its run_exports pins the
+    # matching runtime, so no explicit `run` entry is needed.
+    - libgdal-core
+
+tests:
+  - script:
+      - if: unix
+        then:
+          - test -f ${PREFIX}/lib/gdalplugins/ogr_GeoPBF${SHLIB_EXT}
+          - ogrinfo --formats | grep -q GeoPBF
+        else:
+          - if not exist %LIBRARY_LIB%\gdalplugins\ogr_GeoPBF.dll exit 1
+          - ogrinfo --formats | findstr GeoPBF
+
+about:
+  homepage: https://github.com/kenjiyoshidahome2026-bit/gdal-geopbf
+  summary: GDAL/OGR driver for the GeoPBF compact vector format
+  description: |
+    A GDAL/OGR driver that reads and writes GeoPBF, a compact binary vector
+    format built on Protocol Buffers. Coordinates are delta-encoded integers
+    scaled by a fixed power of ten and attribute names are held once in a
+    file-level dictionary, which makes a GeoPBF file roughly one tenth the
+    size of the equivalent GeoJSON.
+
+    The driver carries its own minimal Protocol Buffers reader and writer, so
+    it adds no dependency beyond GDAL itself. Installing this package makes
+    .geopbf files readable and writable by every GDAL-based tool, including
+    ogrinfo, ogr2ogr and QGIS.
+  license: MIT
+  license_file: LICENSE
+  repository: https://github.com/kenjiyoshidahome2026-bit/gdal-geopbf
+
+extra:
+  recipe-maintainers:
+    - kenjiyoshidahome2026-bit

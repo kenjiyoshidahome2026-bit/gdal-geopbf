@@ -337,7 +337,13 @@ static GDALDataset* OGRGeoPBFDriverOpen(GDALOpenInfo* poOpenInfo) {
     return poDS;
 }
 
+// プラグインの自動読み込みは「ファイル名の接頭辞 → 探すシンボル名」が対になっている:
+//   gdal_Xxx.so → GDALRegister_Xxx() ／ ogr_Xxx.so → RegisterOGRXxx()
+// ベクタドライバは ogr_* が慣習なので後者を正とし、前者も別名として残す（どちらの名前で置いても読める）。
 CPL_C_START
+void CPL_DLL GDALRegister_GeoPBF();
+void CPL_DLL RegisterOGRGeoPBF() { GDALRegister_GeoPBF(); }
+
 void CPL_DLL GDALRegister_GeoPBF() {
     if (GDALGetDriverByName("GeoPBF") != nullptr) return;
     GDALDriver* d = new GDALDriver();

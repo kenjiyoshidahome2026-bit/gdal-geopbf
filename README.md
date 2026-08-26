@@ -32,7 +32,16 @@ cmake --build build
 cmake --install build
 ```
 
-Installs to the GDAL plugin directory (`gdal-config --plugindir`). After install, GDAL loads the driver automatically — no environment variables needed.
+Installs to the GDAL plugin directory (`gdal-config --plugindir`); override it with
+`-DGDAL_PLUGIN_DIR=/path/to/gdalplugins`. After install, GDAL loads the driver
+automatically — no environment variables needed. The built module is `ogr_GeoPBF`,
+following GDAL's naming convention for vector plugins.
+
+To try it without installing:
+
+```bash
+GDAL_DRIVER_PATH=$PWD/build ogrinfo --formats | grep GeoPBF
+```
 
 ## Usage
 
@@ -81,3 +90,11 @@ GDAL_DRIVER_PATH=$PWD/build pytest autotest/ogr/ogr_geopbf.py
 
 `autotest/ogr/data/geopbf/point.geopbf` is written by the reference JavaScript
 implementation, so the suite also covers cross-implementation compatibility.
+
+## Packaging
+
+`conda/` holds a conda-forge recipe in the v1 (`recipe.yaml`) format, ready to be
+copied into `conda-forge/staged-recipes` as `recipes/libgdal-geopbf/`. It needs a
+tagged release and its sha256 filled in first; the header of the recipe lists the
+steps. Upstreaming into GDAL itself is the preferred route — the recipe exists as
+a fallback so the driver can reach users either way.
