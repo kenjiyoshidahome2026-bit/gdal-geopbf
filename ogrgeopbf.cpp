@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstdio>
 #include <ctime>
+#include <algorithm>
 
 // ── Dataset ───────────────────────────────────────────────────────────────────
 
@@ -102,6 +103,8 @@ OGRGeoPBFLayer::~OGRGeoPBFLayer() { m_poFeatureDefn->Release(); }
 void OGRGeoPBFLayer::ResetReading() {
     m_pos  = m_poDS->m_farrayPos;
     m_nFID = 0;
+    m_iNextIdx = 0;
+    m_bUseCandidates = false;   // フィルタが差し替わっていれば次回作り直す
 }
 
 std::string OGRGeoPBFLayer::DecodeValue(PbfReader& msg) {
@@ -148,7 +151,239 @@ std::string OGRGeoPBFLayer::DecodeValue(PbfReader& msg) {
     }
 }
 
+// ── 空間索引（メモリ内）────────────────────────────────────────────────────────
+// ファイル形式は索引を持たない（小ささと引き換え）。開いた時点で中身は全部メモリに
+// あるので、必要になった時だけ一度走査して「地物のバイト範囲と bbox」を作る。
+// これで画面範囲の問い合わせがジオメトリを組み立てずに済む。
+// 遅延構築＝素の全件変換（ogr2ogr）には一切コストを乗せない。
+
+namespace {
+
+// GEOMETRY メッセージから bbox だけを拾う（OGRGeometry を作らない）。
+// 差分の規約は DecodeGeometry と同一＝リング/ラインごとに累算器を戻す。
+bool ScanGeomBBox(PbfReader r, double scale,
+                  double& minx, double& miny, double& maxx, double& maxy) {
+    int type = -1;
+    std::vector<int64_t>  coords;
+    std::vector<uint64_t> lengths;
+    bool bAny = false;
+
+    while (!r.atEnd()) {
+        int wt; int tag = r.readTag(wt);
+        if      (tag == TAG_GTYPE)              type    = (int)r.readVarint();
+        else if (tag == TAG_COORDS && wt == 2)  coords  = r.readPackedSVarint();
+        else if (tag == TAG_LENGTH && wt == 2)  lengths = r.readPackedVarint();
+        else if (tag == TAG_GARRAY && wt == 2) {
+            auto gar = r.enterMessage();
+            while (!gar.atEnd()) {
+                int gw; int gt = gar.readTag(gw);
+                if (gt == TAG_GEOMETRY && gw == 2) {
+                    auto gs = gar.enterMessage();
+                    bAny |= ScanGeomBBox(gs, scale, minx, miny, maxx, maxy);
+                } else gar.skipField(gw);
+            }
+        } else r.skipField(wt);
+    }
+    if (coords.empty()) return bAny;
+
+    auto take = [&](int64_t ix, int64_t iy) {
+        const double x = ix / scale, y = iy / scale;
+        if (x < minx) minx = x;
+        if (y < miny) miny = y;
+        if (x > maxx) maxx = x;
+        if (y > maxy) maxy = y;
+        bAny = true;
+    };
+    auto run = [&](size_t& ci, size_t nPts) {          // 1本＝累算器はここで完結
+        int64_t cx = 0, cy = 0;
+        for (size_t j = 0; j < nPts && ci + 1 < coords.size(); j++, ci += 2) {
+            cx += coords[ci]; cy += coords[ci + 1];
+            take(cx, cy);
+        }
+    };
+
+    size_t ci = 0;
+    if (type == 0) {                                   // Point＝絶対値
+        take(coords[0], coords.size() > 1 ? coords[1] : 0);
+    } else if (type == 1 || type == 2) {               // 連続した1本の差分列
+        run(ci, coords.size() / 2);
+    } else if (type == 3 || type == 4) {               // LENGTH＝本/リングごとの点数
+        for (uint64_t len : lengths) run(ci, (size_t)len);
+    } else if (type == 5) {                            // [ポリゴン数, リング数, 点数…]
+        size_t li = 0;
+        if (li < lengths.size()) {
+            const size_t nPoly = (size_t)lengths[li++];
+            for (size_t pi = 0; pi < nPoly && li < lengths.size(); pi++) {
+                const size_t nRing = (size_t)lengths[li++];
+                for (size_t ri = 0; ri < nRing && li < lengths.size(); ri++)
+                    run(ci, (size_t)lengths[li++]);
+            }
+        }
+    }
+    return bAny;
+}
+
+constexpr int32_t BBOX_EMPTY_MIN = 2147483647;         // 幾何なし＝空 bbox の印
+constexpr int32_t BBOX_EMPTY_MAX = -2147483647 - 1;
+inline int32_t Q6(double v) {                          // 1e-6 度の整数（索引の選別用）
+    const double q = v * 1e6;
+    return (int32_t)(q > 2.1e9 ? 2.1e9 : q < -2.1e9 ? -2.1e9 : q);
+}
+
+}  // namespace
+
+void OGRGeoPBFLayer::BuildIndex() {
+    if (m_bIndexBuilt) return;
+    m_bIndexBuilt = true;
+
+    const uint8_t* data = m_poDS->m_data.data();
+    const size_t   fend = m_poDS->m_farrayEnd;
+    const double   scale = m_poDS->m_scale;
+    m_sExtent = OGREnvelope();
+
+    size_t pos = m_poDS->m_farrayPos;
+    while (pos < fend) {
+        PbfReader r(data, pos, fend);
+        int wt; int tag = r.readTag(wt);
+        if (tag != TAG_FEATURE || wt != 2) { r.skipField(wt); pos = r.pos; continue; }
+        const size_t len = r.readVarint();
+        const size_t start = r.pos, end = r.pos + len;
+        pos = end;
+
+        FeatRec rec{ start, end, BBOX_EMPTY_MIN, BBOX_EMPTY_MIN, BBOX_EMPTY_MAX, BBOX_EMPTY_MAX };
+        double minx = 1e300, miny = 1e300, maxx = -1e300, maxy = -1e300;
+        PbfReader feat(data, start, end);
+        while (!feat.atEnd()) {
+            int fwt; int ftag = feat.readTag(fwt);
+            if (ftag == TAG_GEOMETRY && fwt == 2) {
+                auto gr = feat.enterMessage();
+                if (ScanGeomBBox(gr, scale, minx, miny, maxx, maxy)) {
+                    rec.minx = Q6(minx); rec.miny = Q6(miny);
+                    rec.maxx = Q6(maxx); rec.maxy = Q6(maxy);
+                    OGREnvelope e; e.MinX = minx; e.MinY = miny; e.MaxX = maxx; e.MaxY = maxy;
+                    m_sExtent.Merge(e);
+                }
+            } else feat.skipField(fwt);
+        }
+        m_index.push_back(rec);
+    }
+
+    // 一様格子（上限 256×256）。点なら1セル、面なら跨いだセル全部に添字を置く。
+    if (m_index.empty() || !m_sExtent.IsInit()) return;
+    const size_t n = m_index.size();
+    int g = (int)std::sqrt((double)n / 8.0);
+    if (g < 1) g = 1;
+    if (g > 256) g = 256;
+    m_nGridW = m_nGridH = g;
+    m_dfGridMinX = m_sExtent.MinX; m_dfGridMinY = m_sExtent.MinY;
+    m_dfGridStepX = std::max(1e-12, (m_sExtent.MaxX - m_sExtent.MinX) / g);
+    m_dfGridStepY = std::max(1e-12, (m_sExtent.MaxY - m_sExtent.MinY) / g);
+    m_grid.assign((size_t)g * g, {});
+    for (uint32_t i = 0; i < (uint32_t)n; i++) {
+        const FeatRec& rc = m_index[i];
+        if (rc.minx > rc.maxx) continue;               // 幾何なし
+        const int x0 = std::max(0, std::min(g - 1, (int)((rc.minx / 1e6 - m_dfGridMinX) / m_dfGridStepX)));
+        const int x1 = std::max(0, std::min(g - 1, (int)((rc.maxx / 1e6 - m_dfGridMinX) / m_dfGridStepX)));
+        const int y0 = std::max(0, std::min(g - 1, (int)((rc.miny / 1e6 - m_dfGridMinY) / m_dfGridStepY)));
+        const int y1 = std::max(0, std::min(g - 1, (int)((rc.maxy / 1e6 - m_dfGridMinY) / m_dfGridStepY)));
+        for (int y = y0; y <= y1; y++)
+            for (int x = x0; x <= x1; x++)
+                m_grid[(size_t)y * g + x].push_back(i);
+    }
+    CPLDebug("GeoPBF", "index built: %zu features, %dx%d grid", n, g, g);
+}
+
+// 現在の空間フィルタ範囲に触れる格子セルから候補の地物添字を集める
+void OGRGeoPBFLayer::PrepareCandidates() {
+    m_anCandidates.clear();
+    m_iNextIdx = 0;
+    m_bUseCandidates = true;
+    m_sCandEnv = m_sFilterEnvelope;
+
+    if (m_grid.empty()) {                              // 格子が無い（空/幾何なし）＝全件を候補に
+        m_anCandidates.reserve(m_index.size());
+        for (uint32_t i = 0; i < (uint32_t)m_index.size(); i++) m_anCandidates.push_back(i);
+        return;
+    }
+    const int g = m_nGridW;
+    const int x0 = std::max(0, std::min(g - 1, (int)((m_sFilterEnvelope.MinX - m_dfGridMinX) / m_dfGridStepX)));
+    const int x1 = std::max(0, std::min(g - 1, (int)((m_sFilterEnvelope.MaxX - m_dfGridMinX) / m_dfGridStepX)));
+    const int y0 = std::max(0, std::min(g - 1, (int)((m_sFilterEnvelope.MinY - m_dfGridMinY) / m_dfGridStepY)));
+    const int y1 = std::max(0, std::min(g - 1, (int)((m_sFilterEnvelope.MaxY - m_dfGridMinY) / m_dfGridStepY)));
+    const int32_t fx0 = Q6(m_sFilterEnvelope.MinX), fy0 = Q6(m_sFilterEnvelope.MinY);
+    const int32_t fx1 = Q6(m_sFilterEnvelope.MaxX), fy1 = Q6(m_sFilterEnvelope.MaxY);
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+            for (uint32_t i : m_grid[(size_t)y * g + x]) {
+                const FeatRec& rc = m_index[i];        // セル内でも bbox で最終選別
+                if (rc.maxx < fx0 || rc.minx > fx1 || rc.maxy < fy0 || rc.miny > fy1) continue;
+                m_anCandidates.push_back(i);
+            }
+        }
+    }
+    std::sort(m_anCandidates.begin(), m_anCandidates.end());   // FID 順を保つ（面が複数セルに跨る分の重複も消す）
+    m_anCandidates.erase(std::unique(m_anCandidates.begin(), m_anCandidates.end()), m_anCandidates.end());
+}
+
+// FEATURE メッセージ本体（start..end）から OGRFeature を組み立てる
+OGRFeature* OGRGeoPBFLayer::FeatureFromRecord(const FeatRec& rec, GIntBig nFID) {
+    PbfReader feat(m_poDS->m_data.data(), (size_t)rec.start, (size_t)rec.end);
+
+    OGRFeature* poFeature = new OGRFeature(m_poFeatureDefn);
+    poFeature->SetFID(nFID);
+
+    std::vector<std::string> values;
+    std::vector<uint64_t>    index;
+    OGRGeometry* geom = nullptr;
+
+    while (!feat.atEnd()) {
+        int fwt; int ftag = feat.readTag(fwt);
+        if (ftag == TAG_GEOMETRY && fwt == 2) {
+            auto gr = feat.enterMessage();
+            geom = DecodeGeometry(gr);
+        } else if (ftag == TAG_VALUE && fwt == 2) {
+            auto vr = feat.enterMessage();
+            values.push_back(DecodeValue(vr));
+        } else if (ftag == TAG_INDEX && fwt == 2) {
+            index = feat.readPackedVarint();
+        } else {
+            feat.skipField(fwt);
+        }
+    }
+    for (size_t i = 0; i < index.size() && i < values.size(); i++) {
+        const int fi = (int)index[i];
+        if (fi < m_poFeatureDefn->GetFieldCount() && !values[i].empty())
+            poFeature->SetField(fi, values[i].c_str());
+    }
+    if (geom) {
+        geom->assignSpatialReference(m_poFeatureDefn->GetGeomFieldDefn(0)->GetSpatialRef());
+        poFeature->SetGeometryDirectly(geom);
+    }
+    return poFeature;
+}
+
 OGRFeature* OGRGeoPBFLayer::GetNextFeature() {
+    // 空間フィルタあり＝索引経路（候補だけを組み立てる）
+    if (m_poFilterGeom) {
+        BuildIndex();
+        if (!m_bUseCandidates || m_sCandEnv.MinX != m_sFilterEnvelope.MinX ||
+            m_sCandEnv.MinY != m_sFilterEnvelope.MinY ||
+            m_sCandEnv.MaxX != m_sFilterEnvelope.MaxX ||
+            m_sCandEnv.MaxY != m_sFilterEnvelope.MaxY)
+            PrepareCandidates();
+
+        while (m_iNextIdx < m_anCandidates.size()) {
+            const uint32_t i = m_anCandidates[m_iNextIdx++];
+            OGRFeature* poFeature = FeatureFromRecord(m_index[i], (GIntBig)i);
+            if ((m_poAttrQuery == nullptr || m_poAttrQuery->Evaluate(poFeature)) &&
+                FilterGeometry(poFeature->GetGeometryRef()))
+                return poFeature;
+            delete poFeature;
+        }
+        return nullptr;
+    }
+
+    // フィルタなし＝逐次読み（索引を作らない＝全件変換にコストを乗せない）
     const uint8_t* data = m_poDS->m_data.data();
     const size_t   fend = m_poDS->m_farrayEnd;
 
@@ -156,45 +391,47 @@ OGRFeature* OGRGeoPBFLayer::GetNextFeature() {
         PbfReader r(data, m_pos, fend);
         int wt; int tag = r.readTag(wt);
         if (tag != TAG_FEATURE || wt != 2) { r.skipField(wt); m_pos = r.pos; continue; }
+        const size_t len = r.readVarint();
+        const FeatRec rec{ r.pos, r.pos + len, 0, 0, 0, 0 };
+        m_pos = r.pos + len;
 
-        auto feat = r.enterMessage();
-        m_pos = r.pos;
-
-        OGRFeature* poFeature = new OGRFeature(m_poFeatureDefn);
-        poFeature->SetFID(m_nFID++);
-
-        std::vector<std::string> values;
-        std::vector<uint64_t>    index;
-        OGRGeometry* geom = nullptr;
-
-        while (!feat.atEnd()) {
-            int fwt; int ftag = feat.readTag(fwt);
-            if (ftag == TAG_GEOMETRY && fwt == 2) {
-                auto gr = feat.enterMessage();
-                geom = DecodeGeometry(gr);
-            } else if (ftag == TAG_VALUE && fwt == 2) {
-                auto vr = feat.enterMessage();
-                values.push_back(DecodeValue(vr));
-            } else if (ftag == TAG_INDEX && fwt == 2) {
-                index = feat.readPackedVarint();
-            } else {
-                feat.skipField(fwt);
-            }
-        }
-
-        for (size_t i = 0; i < index.size() && i < values.size(); i++) {
-            int fi = (int)index[i];
-            if (fi < m_poFeatureDefn->GetFieldCount() && !values[i].empty())
-                poFeature->SetField(fi, values[i].c_str());
-        }
-        if (geom) poFeature->SetGeometryDirectly(geom);
-
-        if ((m_poAttrQuery == nullptr || m_poAttrQuery->Evaluate(poFeature)) &&
-            (m_poFilterGeom == nullptr || FilterGeometry(geom)))
+        OGRFeature* poFeature = FeatureFromRecord(rec, m_nFID++);
+        if (m_poAttrQuery == nullptr || m_poAttrQuery->Evaluate(poFeature))
             return poFeature;
         delete poFeature;
     }
     return nullptr;
+}
+
+OGRFeature* OGRGeoPBFLayer::GetFeature(GIntBig nFID) {
+    BuildIndex();
+    if (nFID < 0 || (size_t)nFID >= m_index.size()) return nullptr;
+    return FeatureFromRecord(m_index[(size_t)nFID], nFID);
+}
+
+GIntBig OGRGeoPBFLayer::GetFeatureCount(int bForce) {
+    if (m_poFilterGeom == nullptr && m_poAttrQuery == nullptr) {
+        BuildIndex();
+        return (GIntBig)m_index.size();
+    }
+    return OGRLayer::GetFeatureCount(bForce);
+}
+
+OGRErr OGRGeoPBFLayer::IGetExtent(int /*iGeomField*/, OGREnvelope* psExtent, bool /*bForce*/) {
+    BuildIndex();
+    if (!m_sExtent.IsInit()) return OGRERR_FAILURE;
+    *psExtent = m_sExtent;
+    return OGRERR_NONE;
+}
+
+int OGRGeoPBFLayer::TestCapability(const char* pszCap) const {
+    if (EQUAL(pszCap, OLCFastFeatureCount))
+        return m_poFilterGeom == nullptr && m_poAttrQuery == nullptr;
+    if (EQUAL(pszCap, OLCFastGetExtent))    return TRUE;
+    if (EQUAL(pszCap, OLCFastSpatialFilter)) return TRUE;   // 索引で候補を絞る（必要時に構築）
+    if (EQUAL(pszCap, OLCRandomRead))       return TRUE;    // FID = 出現順＝索引で直接引ける
+    if (EQUAL(pszCap, OLCStringsAsUTF8))    return TRUE;
+    return FALSE;
 }
 
 // ── Geometry decoding ─────────────────────────────────────────────────────────

@@ -79,6 +79,36 @@ Files are recognised by their content, so the ``.geopbf`` extension is not
 required. Files compressed with gzip are recognised by extension, since their
 header cannot be inspected without decompressing them.
 
+Performance
+-----------
+
+The format carries no spatial index — that is the price of its small size. The
+driver compensates in memory: the first time a layer is asked for its feature
+count, its extent, a feature by identifier, or a spatially filtered iteration,
+it scans the file once and records each feature's byte range and bounding box,
+then buckets those into a uniform grid. Subsequent window queries touch only the
+candidate features and never build geometries that fall outside the filter.
+
+The index is built lazily, so a plain full-table conversion never pays for it.
+
+Measured on 500,000 points (a 32 MB file; the same data is 60 MB as GeoPackage
+and 78 MB as FlatGeobuf):
+
+==================================  ==========
+Operation                           Time
+==================================  ==========
+Open                                    23 ms
+First call that builds the index        60 ms
+``GetExtent`` (cached afterwards)      < 1 ms
+Window query returning 460 features    1.2 ms
+Full scan of all features            1 010 ms
+==================================  ==========
+
+The layer advertises :cpp:enumerator:`OLCFastFeatureCount`,
+:cpp:enumerator:`OLCFastGetExtent`, :cpp:enumerator:`OLCFastSpatialFilter` and
+:cpp:enumerator:`OLCRandomRead`. Feature identifiers are the zero-based position
+of the feature in the file.
+
 Dataset creation options
 ------------------------
 
@@ -131,7 +161,8 @@ Limitations
 -  No update mode: existing files can be read or overwritten, not edited.
 -  The whole file is read into memory when opened, and written features are
    held in memory until the dataset is closed, because the attribute-name
-   dictionary is only complete once every feature has been seen.
+   dictionary is only complete once every feature has been seen. The optional
+   in-memory index adds about 32 bytes per feature on top of that.
 
 See Also
 --------

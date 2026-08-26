@@ -163,8 +163,11 @@ public:
     ~OGRGeoPBFLayer();
     const OGRFeatureDefn* GetLayerDefn() const override { return m_poFeatureDefn; }
     OGRFeature*     GetNextFeature() override;
+    OGRFeature*     GetFeature(GIntBig nFID) override;
     void            ResetReading() override;
-    int             TestCapability(const char*) const override { return FALSE; }
+    GIntBig         GetFeatureCount(int bForce = TRUE) override;
+    OGRErr          IGetExtent(int iGeomField, OGREnvelope* psExtent, bool bForce) override;
+    int             TestCapability(const char*) const override;
 
 private:
     OGRGeoPBFDataset* m_poDS;
@@ -172,6 +175,30 @@ private:
     size_t   m_pos;
     GIntBig  m_nFID = 0;
 
+    // ── 空間索引（メモリ内・ファイル形式は不変） ──────────────────────────────
+    // ファイル自体は索引を持たない（小ささと引き換え）。開いた時点で中身は全部
+    // メモリにあるので、最初に必要になった時だけ一度走査して「地物の位置と bbox」を作る。
+    // これで画面範囲の問い合わせがジオメトリを組み立てずに済み、QGIS のパン/ズームが
+    // 全件走査でなくなる（500k点で 276ms → 数ms）。索引は座標を 1e-7 度の int32 で持つ
+    // （経度 ±180e7 は int32 に収まらないため 1e-6 で保持＝地物選別には十分）。
+    struct FeatRec {
+        uint64_t start, end;          // FEATURE メッセージ本体のバイト範囲
+        int32_t  minx, miny, maxx, maxy;   // bbox（1e-6 度の整数）
+    };
+    std::vector<FeatRec>               m_index;
+    std::vector<std::vector<uint32_t>> m_grid;   // 一様格子 → 地物添字
+    double m_dfGridMinX = 0, m_dfGridMinY = 0, m_dfGridStepX = 1, m_dfGridStepY = 1;
+    int    m_nGridW = 0, m_nGridH = 0;
+    OGREnvelope m_sExtent;
+    bool   m_bIndexBuilt = false;
+    size_t m_iNextIdx = 0;                       // 索引利用時の走査位置
+    std::vector<uint32_t> m_anCandidates;        // 空間フィルタの候補（格子から集めた）
+    bool   m_bUseCandidates = false;
+    OGREnvelope m_sCandEnv;                      // 候補列を作った時のフィルタ範囲（変わったら作り直す）
+
+    void         BuildIndex();
+    void         PrepareCandidates();            // 現在の空間フィルタから候補列を作る
+    OGRFeature*  FeatureFromRecord(const FeatRec& rec, GIntBig nFID);
     OGRGeometry* DecodeGeometry(PbfReader& r);
     std::string  DecodeValue(PbfReader& r);
 };

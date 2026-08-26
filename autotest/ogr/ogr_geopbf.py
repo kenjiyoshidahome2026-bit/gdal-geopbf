@@ -317,3 +317,141 @@ def test_ogr_geopbf_no_update():
 
     with gdal.quiet_errors():
         assert ogr.Open(os.path.join(DATA, "point.geopbf"), update=1) is None
+
+
+###############################################################################
+# Spatial index: the layer builds one in memory, so results must match a brute
+# force scan exactly — a wrong index is worse than no index.
+
+
+@pytest.fixture()
+def indexed_layer(tmp_path):
+    """A layer mixing points, a polygon spanning many grid cells, and a
+    geometry-less feature."""
+
+    filename = str(tmp_path / "index.geopbf")
+    ds = ogr.GetDriverByName("GeoPBF").CreateDataSource(filename)
+    lyr = ds.CreateLayer("idx", geom_type=ogr.wkbUnknown)
+    lyr.CreateField(ogr.FieldDefn("tag", ogr.OFTString))
+
+    wkts = []
+    for i in range(20):
+        for j in range(20):
+            wkts.append(f"POINT ({130 + i * 0.5} {30 + j * 0.5})")
+    # spans a wide area: must be found from any cell it overlaps
+    wkts.append("POLYGON ((131 31,139 31,139 39,131 39,131 31))")
+    # long diagonal line
+    wkts.append("LINESTRING (130 30,139.5 39.5)")
+
+    for i, wkt in enumerate(wkts):
+        f = ogr.Feature(lyr.GetLayerDefn())
+        f.SetGeometry(ogr.CreateGeometryFromWkt(wkt))
+        f["tag"] = f"g{i}"
+        lyr.CreateFeature(f)
+    f = ogr.Feature(lyr.GetLayerDefn())   # no geometry at all
+    f["tag"] = "nogeom"
+    lyr.CreateFeature(f)
+    ds = None
+
+    return filename, len(wkts) + 1
+
+
+def test_ogr_geopbf_capabilities(indexed_layer):
+
+    filename, _ = indexed_layer
+    ds = ogr.Open(filename)
+    lyr = ds.GetLayer(0)
+    assert lyr.TestCapability(ogr.OLCFastFeatureCount)
+    assert lyr.TestCapability(ogr.OLCFastGetExtent)
+    assert lyr.TestCapability(ogr.OLCFastSpatialFilter)
+    assert lyr.TestCapability(ogr.OLCRandomRead)
+
+
+def test_ogr_geopbf_extent_and_count(indexed_layer):
+
+    filename, total = indexed_layer
+    ds = ogr.Open(filename)
+    lyr = ds.GetLayer(0)
+    assert lyr.GetFeatureCount() == total
+
+    minx, maxx, miny, maxy = lyr.GetExtent()
+    assert minx == pytest.approx(130, abs=1e-6)
+    assert maxx == pytest.approx(139.5, abs=1e-6)
+    assert miny == pytest.approx(30, abs=1e-6)
+    assert maxy == pytest.approx(39.5, abs=1e-6)
+
+
+@pytest.mark.parametrize(
+    "window",
+    [
+        (130.0, 30.0, 130.4, 30.4),     # corner, few features
+        (134.0, 34.0, 135.0, 35.0),     # middle, crosses the big polygon
+        (138.9, 38.9, 140.0, 40.0),     # far corner
+        (120.0, 20.0, 150.0, 50.0),     # everything
+        (100.0, 10.0, 110.0, 20.0),     # nothing
+    ],
+)
+def test_ogr_geopbf_spatial_filter_matches_bruteforce(indexed_layer, window):
+
+    filename, _ = indexed_layer
+
+    # ground truth: no filter, test every geometry in Python
+    ds = ogr.Open(filename)
+    lyr = ds.GetLayer(0)
+    win = ogr.CreateGeometryFromWkt(
+        "POLYGON (({0} {1},{2} {1},{2} {3},{0} {3},{0} {1}))".format(
+            window[0], window[1], window[2], window[3]
+        )
+    )
+    expected = set()
+    for f in lyr:
+        g = f.GetGeometryRef()
+        if g is not None and g.Intersects(win):
+            expected.add(f["tag"])
+
+    # indexed path
+    ds2 = ogr.Open(filename)
+    lyr2 = ds2.GetLayer(0)
+    lyr2.SetSpatialFilterRect(*window)
+    got = {f["tag"] for f in lyr2}
+
+    assert got == expected, f"index disagrees with brute force for {window}"
+    assert "nogeom" not in got
+
+
+def test_ogr_geopbf_spatial_filter_reuse(indexed_layer):
+    """Changing the filter without an explicit ResetReading must take effect."""
+
+    filename, total = indexed_layer
+    ds = ogr.Open(filename)
+    lyr = ds.GetLayer(0)
+
+    lyr.SetSpatialFilterRect(130.0, 30.0, 130.4, 30.4)
+    first = sum(1 for _ in lyr)
+
+    lyr.SetSpatialFilterRect(120.0, 20.0, 150.0, 50.0)
+    second = sum(1 for _ in lyr)
+    assert second > first
+    assert second == total - 1   # everything except the geometry-less feature
+
+    lyr.SetSpatialFilter(None)
+    assert sum(1 for _ in lyr) == total
+
+
+def test_ogr_geopbf_random_read(indexed_layer):
+
+    filename, total = indexed_layer
+    ds = ogr.Open(filename)
+    lyr = ds.GetLayer(0)
+
+    sequential = [(f.GetFID(), f["tag"], f.GetGeometryRef().ExportToWkt()
+                   if f.GetGeometryRef() else None) for f in lyr]
+    assert len(sequential) == total
+
+    for fid, tag, wkt in [sequential[0], sequential[len(sequential) // 2], sequential[-1]]:
+        f = lyr.GetFeature(fid)
+        assert f is not None
+        assert f["tag"] == tag
+        assert (f.GetGeometryRef().ExportToWkt() if f.GetGeometryRef() else None) == wkt
+
+    assert lyr.GetFeature(total + 100) is None
