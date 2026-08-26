@@ -1,10 +1,26 @@
 #pragma once
 #include "ogrsf_frmts.h"
+#include "gdal_version.h"
 #include <vector>
 #include <string>
 #include <cstdint>
 #include <cstring>
 #include <cinttypes>
+
+// ── GDAL 版差の吸収 ───────────────────────────────────────────────────────────
+// 3.13 で二つ変わった: GDALDataset::Close() が進捗引数を取るようになり、
+// ドライバの Create コールバックが char** から CSLConstList になった。
+// QGIS 4.2 が同梱するのは 3.12 系＝ここを吸収しないと最も客の多い環境で建たない。
+#if GDAL_VERSION_NUM >= GDAL_COMPUTE_VERSION(3, 13, 0)
+#  define GEOPBF_CREATE_OPTIONS CSLConstList
+#  define GEOPBF_CLOSE_DECL \
+      CPLErr Close(GDALProgressFunc pfnProgress = nullptr, void* pProgressData = nullptr) override
+#  define GEOPBF_CLOSE_DEFN(cls) CPLErr cls::Close(GDALProgressFunc, void*)
+#else
+#  define GEOPBF_CREATE_OPTIONS char**
+#  define GEOPBF_CLOSE_DECL      CPLErr Close() override
+#  define GEOPBF_CLOSE_DEFN(cls) CPLErr cls::Close()
+#endif
 
 // ── Minimal Protobuf reader ───────────────────────────────────────────────────
 
@@ -164,7 +180,7 @@ private:
 // 単層フォーマット＝1データセット1レイヤ。地物は逐次エンコードしてメモリに積み、
 // Close()/デストラクタで「ヘッダ → FARRAY」を一括で書き出す（KEYS 辞書が全地物を見終わるまで確定しないため）。
 
-GDALDataset* OGRGeoPBFDriverCreate(const char* pszName, int, int, int, GDALDataType, CSLConstList);
+GDALDataset* OGRGeoPBFDriverCreate(const char* pszName, int, int, int, GDALDataType, GEOPBF_CREATE_OPTIONS);
 
 class OGRGeoPBFWriteLayer final : public OGRLayer {
 public:
@@ -200,7 +216,7 @@ public:
     int              GetLayerCount() const override { return m_poLayer ? 1 : 0; }
     const OGRLayer*  GetLayer(int i) const override;
     int              TestCapability(const char* pszCap) const override;
-    CPLErr           Close(GDALProgressFunc pfnProgress = nullptr, void* pProgressData = nullptr) override;
+    GEOPBF_CLOSE_DECL;
 
 protected:
     OGRLayer* ICreateLayer(const char* pszName, const OGRGeomFieldDefn* poGeomFieldDefn,

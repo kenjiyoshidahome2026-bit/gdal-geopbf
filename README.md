@@ -15,7 +15,7 @@ GeoPBF is a compact binary vector format based on Protocol Buffers with delta-en
 
 ## Requirements
 
-- GDAL ≥ 3.x
+- GDAL ≥ 3.12 (tested against 3.12.4 and 3.13.3)
 - CMake ≥ 3.16
 - C++17 compiler
 
@@ -98,3 +98,48 @@ copied into `conda-forge/staged-recipes` as `recipes/libgdal-geopbf/`. It needs 
 tagged release and its sha256 filled in first; the header of the recipe lists the
 steps. Upstreaming into GDAL itself is the preferred route — the recipe exists as
 a fallback so the driver can reach users either way.
+
+## Using it with QGIS
+
+QGIS ships its own copy of GDAL, so the plugin has to be built against *that* GDAL,
+not the one on your `PATH`. On macOS there are two separate obstacles worth knowing
+about, because neither produces an obvious error message.
+
+**1. ABI.** `QGIS.app` bundles its own `libgdal` (QGIS 4.2 → GDAL 3.12). A plugin
+linked against a different GDAL will not load, or will pull a second copy of GDAL
+into the process. Build against the matching headers and let the symbols resolve
+at load time instead of linking:
+
+```bash
+# headers for the GDAL version QGIS bundles — check with
+#   /Applications/QGIS*.app/Contents/MacOS/ogrinfo --version
+curl -sLO https://github.com/OSGeo/gdal/releases/download/v3.12.4/gdal-3.12.4.tar.gz
+tar xzf gdal-3.12.4.tar.gz
+sed -e 's/@GDAL_VERSION_MAJOR@/3/' -e 's/@GDAL_VERSION_MINOR@/12/' \
+    -e 's/@GDAL_VERSION_REV@/4/'   -e 's/@GDAL_VERSION_BUILD@/0/' \
+    -e 's/@GDAL_RELEASE_DATE@/20260422/' -e 's/@GDAL_RELEASE_NAME@/3.12.4/' \
+    gdal-3.12.4/gcore/gdal_version.h.in > gen/gdal_version.h
+cp $(dirname $(command -v gdalinfo))/../include/cpl_config.h gen/   # platform defines
+
+clang++ -std=c++17 -O2 -dynamiclib -undefined dynamic_lookup \
+  -Igen -Igdal-3.12.4/port -Igdal-3.12.4/gcore -Igdal-3.12.4/ogr \
+  -Igdal-3.12.4/ogr/ogrsf_frmts -Igdal-3.12.4/alg \
+  -o ~/gdalplugins/ogr_GeoPBF.so ogrgeopbf.cpp ogrgeopbfwrite.cpp
+```
+
+**2. Code signing.** `QGIS.app` carries the
+`com.apple.security.cs.disable-library-validation` entitlement, so it *will* load a
+third-party plugin. The command line tools bundled beside it (`ogrinfo`,
+`ogr2ogr`, `qgis_process`) do **not** carry that entitlement, and refuse with
+`different Team IDs`. Test through the GUI, or through a re-signed copy of the tool:
+
+```bash
+cp /Applications/QGIS*.app/Contents/MacOS/ogrinfo /tmp/ogrinfo
+codesign --force -s - --entitlements ent.plist /tmp/ogrinfo   # both cs.* entitlements
+DYLD_LIBRARY_PATH=/Applications/QGIS*.app/Contents/Frameworks \
+GDAL_DRIVER_PATH=~/gdalplugins /tmp/ogrinfo --formats | grep GeoPBF
+```
+
+**Pointing QGIS at the plugin.** Settings → Options → System → Environment: add
+`GDAL_DRIVER_PATH` = the directory holding `ogr_GeoPBF.so`, then restart QGIS.
+`.geopbf` files can then be opened by drag and drop like any other vector format.

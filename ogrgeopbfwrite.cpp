@@ -341,7 +341,7 @@ OGRErr OGRGeoPBFWriteDataset::WriteFile() {
     return OGRERR_NONE;
 }
 
-CPLErr OGRGeoPBFWriteDataset::Close(GDALProgressFunc, void*) {
+GEOPBF_CLOSE_DEFN(OGRGeoPBFWriteDataset) {
     CPLErr eErr = CE_None;
     if (!m_bWritten) {
         m_bWritten = true;
@@ -353,7 +353,7 @@ CPLErr OGRGeoPBFWriteDataset::Close(GDALProgressFunc, void*) {
 // ── Driver entry point ────────────────────────────────────────────────────────
 
 GDALDataset* OGRGeoPBFDriverCreate(const char* pszName, int, int, int, GDALDataType,
-                                   CSLConstList papszOptions) {
+                                   GEOPBF_CREATE_OPTIONS papszOptions) {
     const int nPrecision = atoi(CSLFetchNameValueDef(papszOptions, "PRECISION", "6"));
     if (nPrecision < 0 || nPrecision > 9) {
         CPLError(CE_Failure, CPLE_IllegalArg, "GeoPBF: PRECISION must be between 0 and 9.");
