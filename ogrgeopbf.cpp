@@ -123,6 +123,10 @@ OGRGeoPBFLayer::OGRGeoPBFLayer(OGRGeoPBFDataset* poDS)
         OGRFieldDefn f(key.c_str(), OFTString);
         m_poFeatureDefn->AddFieldDefn(&f);
     }
+
+    // ファイルの PRECISION をメタデータで公開する。ogr2ogr は既定でレイヤのメタデータを
+    // 複製するので、GeoPBF→GeoPBF の変換で桁が黙って落ちなくなる（筆界データで 1e-7→1e-6 は 1.1cm→11cm）。
+    SetMetadataItem("PRECISION", CPLSPrintf("%d", (int)std::lround(std::log10(poDS->m_scale))));
 }
 
 OGRGeoPBFLayer::~OGRGeoPBFLayer() { m_poFeatureDefn->Release(); }

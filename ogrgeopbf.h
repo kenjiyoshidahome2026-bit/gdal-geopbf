@@ -16,10 +16,12 @@
 #  define GEOPBF_CLOSE_DECL \
       CPLErr Close(GDALProgressFunc pfnProgress = nullptr, void* pProgressData = nullptr) override
 #  define GEOPBF_CLOSE_DEFN(cls) CPLErr cls::Close(GDALProgressFunc, void*)
+#  define GEOPBF_METADATA_LIST   CSLConstList
 #else
 #  define GEOPBF_CREATE_OPTIONS char**
 #  define GEOPBF_CLOSE_DECL      CPLErr Close() override
 #  define GEOPBF_CLOSE_DEFN(cls) CPLErr cls::Close()
+#  define GEOPBF_METADATA_LIST   char**
 #endif
 
 // ── Minimal Protobuf reader ───────────────────────────────────────────────────
@@ -212,7 +214,7 @@ GDALDataset* OGRGeoPBFDriverCreate(const char* pszName, int, int, int, GDALDataT
 class OGRGeoPBFWriteLayer final : public OGRLayer {
 public:
     OGRGeoPBFWriteLayer(const char* pszName, const OGRSpatialReference* poSRS,
-                        OGRwkbGeometryType eGType, double dfScale);
+                        OGRwkbGeometryType eGType, double dfScale, bool bScaleFromOption);
     ~OGRGeoPBFWriteLayer();
 
     const OGRFeatureDefn* GetLayerDefn() const override { return m_poFeatureDefn; }
@@ -221,6 +223,12 @@ public:
     int         TestCapability(const char* pszCap) const override;
     OGRErr      CreateField(const OGRFieldDefn* poField, int bApproxOK = TRUE) override;
     OGRErr      ICreateFeature(OGRFeature* poFeature) override;
+    // ogr2ogr が複製してくる元レイヤのメタデータから PRECISION を受け取る
+    // （作成オプションで明示された場合はそちらが勝つ）
+    CPLErr      SetMetadataItem(const char* pszName, const char* pszValue,
+                                const char* pszDomain = "") override;
+    CPLErr      SetMetadata(GEOPBF_METADATA_LIST papszMetadata, const char* pszDomain = "") override;
+    double      Scale() const { return m_dfScale; }
 
     const std::vector<std::string>&          Keys()     const { return m_keys; }
     const std::vector<std::vector<uint8_t>>& Features() const { return m_features; }
@@ -230,6 +238,7 @@ private:
     std::vector<std::string>          m_keys;        // = ヘッダの KEYS（フィールド名辞書）
     std::vector<std::vector<uint8_t>> m_features;    // 各要素＝FEATURE メッセージの中身
     double                            m_dfScale;
+    bool                              m_bScaleFromOption;   // 作成オプションで明示された＝メタデータで上書きしない
     bool                              m_bWarnedZ = false;   // Z は形式に無い＝一度だけ警告
 
     void EncodeGeometry(const OGRGeometry* poGeom, PbfWriter& w);   // GEOMETRY メッセージの中身を書く
@@ -237,7 +246,7 @@ private:
 
 class OGRGeoPBFWriteDataset final : public GDALDataset {
 public:
-    OGRGeoPBFWriteDataset(const char* pszFilename, double dfScale, bool bGzip);
+    OGRGeoPBFWriteDataset(const char* pszFilename, double dfScale, bool bGzip, bool bScaleFromOption);
     ~OGRGeoPBFWriteDataset() override;
 
     int              GetLayerCount() const override { return m_poLayer ? 1 : 0; }
@@ -253,6 +262,7 @@ private:
     std::string           m_osFilename;
     double                m_dfScale;
     bool                  m_bGzip;      // 配布形は gzip 済みが通例＝読みと対称に書けるようにする
+    bool                  m_bScaleFromOption;
     OGRGeoPBFWriteLayer*  m_poLayer = nullptr;
     bool                  m_bWritten = false;
 

@@ -61,8 +61,8 @@ std::vector<IPt> QuantizeRing(const OGRLinearRing* poRing, double dfScale) {
 // ── Layer ─────────────────────────────────────────────────────────────────────
 
 OGRGeoPBFWriteLayer::OGRGeoPBFWriteLayer(const char* pszName, const OGRSpatialReference* poSRS,
-                                         OGRwkbGeometryType eGType, double dfScale)
-    : m_dfScale(dfScale)
+                                         OGRwkbGeometryType eGType, double dfScale, bool bScaleFromOption)
+    : m_dfScale(dfScale), m_bScaleFromOption(bScaleFromOption)
 {
     m_poFeatureDefn = new OGRFeatureDefn(pszName);
     m_poFeatureDefn->Reference();
@@ -87,6 +87,25 @@ OGRGeoPBFWriteLayer::OGRGeoPBFWriteLayer(const char* pszName, const OGRSpatialRe
 }
 
 OGRGeoPBFWriteLayer::~OGRGeoPBFWriteLayer() { m_poFeatureDefn->Release(); }
+
+// 元が GeoPBF なら、その PRECISION をそのまま引き継ぐ（黙って桁を落とさない）。
+// -dsco PRECISION= が明示されていればそちらが勝つ。地物を書き始めた後は変えない。
+CPLErr OGRGeoPBFWriteLayer::SetMetadataItem(const char* pszName, const char* pszValue,
+                                            const char* pszDomain) {
+    if (pszName && pszValue && EQUAL(pszName, "PRECISION") &&
+        (pszDomain == nullptr || pszDomain[0] == '\0') &&
+        !m_bScaleFromOption && m_features.empty()) {
+        const int n = atoi(pszValue);
+        if (n >= 0 && n <= 9) m_dfScale = std::pow(10.0, n);
+    }
+    return OGRLayer::SetMetadataItem(pszName, pszValue, pszDomain);
+}
+
+CPLErr OGRGeoPBFWriteLayer::SetMetadata(GEOPBF_METADATA_LIST papszMetadata, const char* pszDomain) {
+    const char* pszPrec = CSLFetchNameValue(papszMetadata, "PRECISION");
+    if (pszPrec) SetMetadataItem("PRECISION", pszPrec, pszDomain);
+    return OGRLayer::SetMetadata(papszMetadata, pszDomain);
+}
 
 int OGRGeoPBFWriteLayer::TestCapability(const char* pszCap) const {
     if (EQUAL(pszCap, OLCSequentialWrite)) return TRUE;
@@ -278,8 +297,10 @@ OGRErr OGRGeoPBFWriteLayer::ICreateFeature(OGRFeature* poFeature) {
 
 // ── Dataset ───────────────────────────────────────────────────────────────────
 
-OGRGeoPBFWriteDataset::OGRGeoPBFWriteDataset(const char* pszFilename, double dfScale, bool bGzip)
-    : m_osFilename(pszFilename), m_dfScale(dfScale), m_bGzip(bGzip)
+OGRGeoPBFWriteDataset::OGRGeoPBFWriteDataset(const char* pszFilename, double dfScale, bool bGzip,
+                                             bool bScaleFromOption)
+    : m_osFilename(pszFilename), m_dfScale(dfScale), m_bGzip(bGzip),
+      m_bScaleFromOption(bScaleFromOption)
 {
     SetDescription(pszFilename);
 }
@@ -309,7 +330,7 @@ OGRLayer* OGRGeoPBFWriteDataset::ICreateLayer(const char* pszName,
     }
     const OGRSpatialReference* poSRS = poGeomFieldDefn ? poGeomFieldDefn->GetSpatialRef() : nullptr;
     const OGRwkbGeometryType eGType = poGeomFieldDefn ? poGeomFieldDefn->GetType() : wkbUnknown;
-    m_poLayer = new OGRGeoPBFWriteLayer(pszName, poSRS, eGType, m_dfScale);
+    m_poLayer = new OGRGeoPBFWriteLayer(pszName, poSRS, eGType, m_dfScale, m_bScaleFromOption);
     return m_poLayer;
 }
 
@@ -320,7 +341,9 @@ OGRErr OGRGeoPBFWriteDataset::WriteFile() {
     out.stringField(TAG_NAME, pszName);
     if (m_poLayer)
         for (const std::string& k : m_poLayer->Keys()) out.stringField(TAG_KEYS, k);
-    out.varintField(TAG_PRECISION, (uint64_t)std::lround(std::log10(m_dfScale)));
+    // 実際に符号化に使われた縮尺はレイヤ側が持つ（メタデータで引き継いだ場合はそちらが正）
+    const double dfScale = m_poLayer ? m_poLayer->Scale() : m_dfScale;
+    out.varintField(TAG_PRECISION, (uint64_t)std::lround(std::log10(dfScale)));
 
     PbfWriter farray;
     if (m_poLayer)
@@ -369,5 +392,7 @@ GDALDataset* OGRGeoPBFDriverCreate(const char* pszName, int, int, int, GDALDataT
         CPLError(CE_Failure, CPLE_IllegalArg, "GeoPBF: COMPRESS must be NONE or GZIP.");
         return nullptr;
     }
-    return new OGRGeoPBFWriteDataset(pszName, std::pow(10.0, nPrecision), EQUAL(pszCompress, "GZIP"));
+    const bool bPrecisionGiven = CSLFetchNameValue(papszOptions, "PRECISION") != nullptr;
+    return new OGRGeoPBFWriteDataset(pszName, std::pow(10.0, nPrecision),
+                                     EQUAL(pszCompress, "GZIP"), bPrecisionGiven);
 }

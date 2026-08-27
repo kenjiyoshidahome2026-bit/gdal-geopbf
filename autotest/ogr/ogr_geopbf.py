@@ -503,3 +503,93 @@ def test_ogr_geopbf_write_compress_invalid(tmp_path):
             str(tmp_path / "bad.geopbf"), options=["COMPRESS=LZ4"]
         )
     assert ds is None
+
+
+###############################################################################
+# PRECISION must survive a GeoPBF -> GeoPBF conversion. Silently dropping a
+# digit turns 1.1 cm into 11 cm, which matters for cadastral data.
+
+
+def _file_precision(path):
+    import gzip as _gzip
+
+    data = open(path, "rb").read()
+    if data[:2] == b"\x1f\x8b":
+        data = _gzip.decompress(data)
+
+    def varint(i):
+        v = s = 0
+        while True:
+            b = data[i]
+            i += 1
+            v |= (b & 0x7F) << s
+            if not b & 0x80:
+                return v, i
+            s += 7
+
+    i = 0
+    while i < len(data):
+        tag, i = varint(i)
+        field, wire = tag >> 3, tag & 7
+        if wire == 0:
+            value, i = varint(i)
+            if field == 3:
+                return value
+        elif wire == 2:
+            ln, i = varint(i)
+            if field == 5:      # FARRAY: header is over
+                break
+            i += ln
+        elif wire == 1:
+            i += 8
+        else:
+            break
+    return None
+
+
+def _make(path, precision=None):
+    opts = [f"PRECISION={precision}"] if precision is not None else []
+    ds = ogr.GetDriverByName("GeoPBF").CreateDataSource(path, options=opts)
+    lyr = ds.CreateLayer("p", geom_type=ogr.wkbPoint)
+    f = ogr.Feature(lyr.GetLayerDefn())
+    f.SetGeometry(ogr.CreateGeometryFromWkt("POINT (139.7660841 35.6813821)"))
+    lyr.CreateFeature(f)
+    ds = None
+
+
+def test_ogr_geopbf_precision_is_recorded(tmp_path):
+
+    p7 = str(tmp_path / "p7.geopbf")
+    _make(p7, 7)
+    assert _file_precision(p7) == 7
+
+    ds = ogr.Open(p7)
+    assert ds.GetLayer(0).GetMetadataItem("PRECISION") == "7"
+
+
+def test_ogr_geopbf_precision_survives_conversion(tmp_path):
+    """geopbf -> geopbf with no options must not quietly coarsen coordinates."""
+
+    src = str(tmp_path / "src7.geopbf")
+    dst = str(tmp_path / "dst.geopbf")
+    _make(src, 7)
+
+    gdal.VectorTranslate(dst, src, format="GeoPBF")
+    assert _file_precision(dst) == 7, "PRECISION was lost in translation"
+
+    ds = ogr.Open(dst)   # データセットを保持（先に解放されるとレイヤが無効になる）
+    f = ds.GetLayer(0).GetNextFeature()
+    g = f.GetGeometryRef()
+    assert g.GetX(0) == pytest.approx(139.7660841, abs=1e-7)
+    assert g.GetY(0) == pytest.approx(35.6813821, abs=1e-7)
+
+
+def test_ogr_geopbf_precision_option_wins(tmp_path):
+    """An explicit creation option must override the inherited value."""
+
+    src = str(tmp_path / "src7.geopbf")
+    dst = str(tmp_path / "dst3.geopbf")
+    _make(src, 7)
+
+    gdal.VectorTranslate(dst, src, format="GeoPBF", datasetCreationOptions=["PRECISION=3"])
+    assert _file_precision(dst) == 3

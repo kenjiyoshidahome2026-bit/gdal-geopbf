@@ -133,9 +133,14 @@ The following dataset creation options are available:
       :default: 6
 
       Number of decimal digits of longitude and latitude preserved in the
-      file. Coordinates are stored as ``round(degrees * 10^PRECISION)``, so the
-      default of 6 keeps about 0.1 m. Lowering it produces smaller files at a
+      file. Coordinates are stored as ``round(degrees * 10^PRECISION)``: 6 digits
+      is about 11 cm, 7 is about 1.1 cm. Lowering it produces smaller files at a
       coarser resolution.
+
+      When the source layer carries a ``PRECISION`` metadata item — which this
+      driver sets when reading a GeoPBF file, and which ``ogr2ogr`` copies by
+      default — that value is inherited, so converting GeoPBF to GeoPBF does not
+      quietly coarsen coordinates. An explicit creation option always wins.
 
 Examples
 --------
