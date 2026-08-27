@@ -626,9 +626,10 @@ void CPL_DLL GDALRegister_GeoPBF() {
         "<CreationOptionList>"
         "  <Option name='PRECISION' type='int' min='0' max='9' default='6' "
         "description='Decimal digits kept in the integer-scaled coordinates (10^n)'/>"
-        "  <Option name='COMPRESS' type='string-select' default='NONE' "
-        "description='Whole-file compression'>"
-        "    <Value>NONE</Value><Value>GZIP</Value>"
+        "  <Option name='COMPRESS' type='string-select' default='GZIP' "
+        "description='Whole-file compression. GeoPBF files are gzipped by convention; "
+        "use NONE only when the consumer cannot inflate.'>"
+        "    <Value>GZIP</Value><Value>NONE</Value>"
         "  </Option>"
         "</CreationOptionList>");
     d->pfnIdentify = OGRGeoPBFDriverIdentify;   // Identify は Open より先に呼ばれる＝他形式のファイルを掴まない

@@ -455,3 +455,51 @@ def test_ogr_geopbf_random_read(indexed_layer):
         assert (f.GetGeometryRef().ExportToWkt() if f.GetGeometryRef() else None) == wkt
 
     assert lyr.GetFeature(total + 100) is None
+
+
+###############################################################################
+# A GeoPBF file is gzipped by convention, so that is what the driver writes
+
+
+def _is_gzip(path):
+    with open(path, "rb") as f:
+        return f.read(2) == b"\x1f\x8b"
+
+
+def test_ogr_geopbf_write_gzip_by_default(tmp_path):
+
+    filename = str(tmp_path / "default.geopbf")
+    ds = ogr.GetDriverByName("GeoPBF").CreateDataSource(filename)
+    lyr = ds.CreateLayer("d", geom_type=ogr.wkbPoint)
+    f = ogr.Feature(lyr.GetLayerDefn())
+    f.SetGeometry(ogr.CreateGeometryFromWkt("POINT (139 35)"))
+    lyr.CreateFeature(f)
+    ds = None
+
+    assert _is_gzip(filename), "the default output should be gzipped"
+    ds = ogr.Open(filename)
+    assert ds.GetLayer(0).GetFeatureCount() == 1
+
+
+def test_ogr_geopbf_write_uncompressed(tmp_path):
+
+    filename = str(tmp_path / "raw.geopbf")
+    ds = ogr.GetDriverByName("GeoPBF").CreateDataSource(filename, options=["COMPRESS=NONE"])
+    lyr = ds.CreateLayer("d", geom_type=ogr.wkbPoint)
+    f = ogr.Feature(lyr.GetLayerDefn())
+    f.SetGeometry(ogr.CreateGeometryFromWkt("POINT (139 35)"))
+    lyr.CreateFeature(f)
+    ds = None
+
+    assert not _is_gzip(filename)
+    ds = ogr.Open(filename)
+    assert ds.GetLayer(0).GetFeatureCount() == 1
+
+
+def test_ogr_geopbf_write_compress_invalid(tmp_path):
+
+    with gdal.quiet_errors():
+        ds = ogr.GetDriverByName("GeoPBF").CreateDataSource(
+            str(tmp_path / "bad.geopbf"), options=["COMPRESS=LZ4"]
+        )
+    assert ds is None

@@ -362,7 +362,9 @@ GDALDataset* OGRGeoPBFDriverCreate(const char* pszName, int, int, int, GDALDataT
         CPLError(CE_Failure, CPLE_IllegalArg, "GeoPBF: PRECISION must be between 0 and 9.");
         return nullptr;
     }
-    const char* pszCompress = CSLFetchNameValueDef(papszOptions, "COMPRESS", "NONE");
+    // 既定は GZIP＝GeoPBF は gzip 済みで配布されるのが形式の作法（形式作者の定め）。
+    // 無圧縮が要るのは、伸長できない相手へ渡す時だけ。
+    const char* pszCompress = CSLFetchNameValueDef(papszOptions, "COMPRESS", "GZIP");
     if (!EQUAL(pszCompress, "NONE") && !EQUAL(pszCompress, "GZIP")) {
         CPLError(CE_Failure, CPLE_IllegalArg, "GeoPBF: COMPRESS must be NONE or GZIP.");
         return nullptr;

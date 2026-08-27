@@ -69,8 +69,10 @@ On read, every attribute is currently exposed as a field of type ``String``.
 Compression
 -----------
 
-A GeoPBF file may be gzip-compressed as a whole; such files carry the same
-``.geopbf`` extension and are decompressed transparently on read.
+A GeoPBF file is gzip-compressed as a whole by convention, and files written by
+this driver are gzipped unless :dsco:`COMPRESS=NONE` is given. Compressed and
+uncompressed files share the ``.geopbf`` extension and are told apart by their
+content, so both are read transparently.
 
 Opening
 -------
@@ -117,13 +119,14 @@ Dataset creation options
 The following dataset creation options are available:
 
 -  .. dsco:: COMPRESS
-      :choices: NONE, GZIP
-      :default: NONE
+      :choices: GZIP, NONE
+      :default: GZIP
 
-      Whether to gzip the whole file on creation. Files distributed by the
-      reference tooling are usually gzipped, and the driver reads either form
-      transparently, so ``GZIP`` produces output symmetric with those files
-      (549 730 parcels: 147 MB uncompressed, 29 MB gzipped).
+      Whether to gzip the whole file on creation. **A GeoPBF file is gzipped by
+      convention** — that is the form the format is published and distributed
+      in — so this is the default. Both forms carry the ``.geopbf`` extension
+      and are read transparently. Use ``NONE`` only for a consumer that cannot
+      inflate (549 730 parcels: 29 MB gzipped, 147 MB uncompressed).
 
 -  .. dsco:: PRECISION
       :choices: 0-9
