@@ -259,16 +259,26 @@ OGRErr OGRGeoPBFWriteLayer::ICreateFeature(OGRFeature* poFeature) {
                 CPLFree(pszJson);
                 break;
             }
-            default:
-                v.stringField(DT_STRING, poFeature->GetFieldAsString(i));
+            default: {
+                // 元が BUFS への参照だったフィールドは、その型のまま書き戻す
+                const char* pszKind = GetMetadataItem(fd->GetNameRef(), "GEOPBF");
+                const int nType = (pszKind && EQUAL(pszKind, "BLOB"))  ? DT_BLOB
+                                : (pszKind && EQUAL(pszKind, "IMAGE")) ? DT_IMAGE
+                                : DT_STRING;
+                v.stringField(nType, poFeature->GetFieldAsString(i));
                 break;
+            }
         }
         index.push_back((uint64_t)i);
         values.bytesField(TAG_VALUE, v.buf);
     }
+    // ★順序が仕様の一部: VALUE を先、INDEX を後に書く。参照実装の読み手は VALUE を
+    // 出現順に溜めながら進み、INDEX に出会った時点で対応付ける＝INDEX が先にあると
+    // 値が空のまま結び付き、属性が全部失われる（自前の読み手は両方溜めてから突合する
+    // ので気付けない。JS 実装との突合で発覚）。
     if (!index.empty()) {
-        feat.packedVarintField(TAG_INDEX, index);
         feat.raw(values.buf.data(), values.buf.size());
+        feat.packedVarintField(TAG_INDEX, index);
     }
 
     m_features.push_back(std::move(feat.buf));
@@ -337,6 +347,24 @@ OGRErr OGRGeoPBFWriteDataset::WriteFile() {
     // 実際に符号化に使われた縮尺はレイヤ側が持つ（メタデータで引き継いだ場合はそちらが正）
     const double dfScale = m_poLayer ? m_poLayer->Scale() : m_dfScale;
     out.varintField(TAG_PRECISION, (uint64_t)std::lround(std::log10(dfScale)));
+
+    // BUFS（バイナリのプール）＝読み手が BUFS メタデータ領域に置いたものをそのまま戻す。
+    // 地物の値には参照（"name:mime:id"）だけが入っているので、ここが欠けると中身が消える。
+    CSLConstList papszBufs = GetMetadata("BUFS");   // 3.13 は const 付きで返る
+    for (int i = 0; papszBufs && papszBufs[i]; i++) {
+        char* pszKey = nullptr;
+        const char* pszB64 = CPLParseNameValue(papszBufs[i], &pszKey);
+        if (pszB64 && pszKey) {
+            std::vector<uint8_t> buf(pszB64, pszB64 + strlen(pszB64));
+            buf.push_back(0);
+            const int nLen = CPLBase64DecodeInPlace(buf.data());
+            buf.resize(nLen > 0 ? nLen : 0);
+            out.bytesField(TAG_BUFS, buf);
+        }
+        CPLFree(pszKey);
+    }
+    if (papszBufs && CSLCount(papszBufs))
+        CPLDebug("GeoPBF", "%d binary buffers carried over", CSLCount(papszBufs));
 
     PbfWriter farray;
     if (m_poLayer)

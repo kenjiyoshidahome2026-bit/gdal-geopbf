@@ -143,7 +143,7 @@ class OGRGeoPBFDataset : public GDALDataset {
 public:
     OGRGeoPBFDataset();
     ~OGRGeoPBFDataset();
-    int Open(const char* pszFilename);
+    int Open(const char* pszFilename, CSLConstList papszOpenOptions = nullptr);
     int GetLayerCount() const override { return 1; }
     const OGRLayer* GetLayer(int i) const override;
 
@@ -154,6 +154,7 @@ public:
     std::string m_name;
     size_t  m_farrayPos = 0;
     size_t  m_farrayEnd = 0;
+    int     m_nTypeScan = 1000;   // 型を決めるために覗く地物数の上限（開くオプション）
 
 private:
     OGRGeoPBFLayer* m_poLayer = nullptr;
@@ -201,8 +202,13 @@ private:
     void         BuildIndex();
     void         PrepareCandidates();            // 現在の空間フィルタから候補列を作る
     OGRFeature*  FeatureFromRecord(const FeatRec& rec, GIntBig nFID);
+    // キーごとのワイヤ上の型（DT_*）。-1=未出現、-2=地物間で食い違う（→文字列に落とす）
+    std::vector<int> m_anKeyType;
+
+    void         ScanFieldTypes();                                  // 先頭から型が揃うまで覗く
+    void         SetFieldFromValue(OGRFeature* f, int iField, PbfReader& msg);
     OGRGeometry* DecodeGeometry(PbfReader& r);
-    std::string  DecodeValue(PbfReader& r);
+    std::string  DecodeValueAsString(PbfReader& r);                 // 文字列に落とす経路（混在キー用）
 };
 
 // ── Write side ────────────────────────────────────────────────────────────────

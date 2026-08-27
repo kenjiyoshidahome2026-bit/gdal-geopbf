@@ -87,7 +87,9 @@ def test_ogr_geopbf_open():
     f = lyr.GetNextFeature()
     assert _geom_almost_equal(f.GetGeometryRef(), ogr.CreateGeometryFromWkt("POINT (139.5 35.5)"))
     assert f["name"] == "alpha"
-    assert f["num"] == "1"  # every value is exposed as a string by the reader
+    # values keep the type they were written with (the wire format records it)
+    assert lyr.GetLayerDefn().GetFieldDefn(1).GetType() == ogr.OFTInteger64
+    assert f["num"] == 1
 
 
 ###############################################################################
@@ -193,8 +195,8 @@ def test_ogr_geopbf_write_roundtrip(tmp_path):
             f"{f.GetGeometryRef().ExportToWkt()}"
         )
         assert f["name"] == f"feat{i}"
-        assert f["num"] == str(i)
-        assert float(f["val"]) == pytest.approx(i + 0.5)
+        assert f["num"] == i
+        assert f["val"] == pytest.approx(i + 0.5)
 
 
 ###############################################################################
@@ -235,15 +237,25 @@ def test_ogr_geopbf_write_field_types(tmp_path):
     ds = None
 
     ds = ogr.Open(filename)
-    f = ds.GetLayer(0).GetNextFeature()
+    lyr = ds.GetLayer(0)
+    d = lyr.GetLayerDefn()
+    f = lyr.GetNextFeature()
+
     assert f["s"] == "text"
-    assert f["i"] == "-7"
-    assert f["i64"] == "12345678901"
-    assert float(f["r"]) == pytest.approx(1.25)
-    assert f["d"].startswith("2026-09-04")
-    assert f["dt"].startswith("2026-09-04T09:30")
-    assert json.loads(f["il"]) == [1, 2, 3]
-    assert f["b"] == "true"
+    assert f["i"] == -7
+    assert f["i64"] == 12345678901
+    assert f["r"] == pytest.approx(1.25)
+    assert json.loads(f["il"]) == [1, 2, 3]        # list fields travel as JSON
+
+    # dates come back as datetimes, in UTC
+    assert d.GetFieldDefn(d.GetFieldIndex("d")).GetType() == ogr.OFTDateTime
+    y, mo, dy, h, mi, sec, tz = f.GetFieldAsDateTime(d.GetFieldIndex("dt"))
+    assert (y, mo, dy, h, mi) == (2026, 9, 4, 9, 30)
+
+    # booleans keep their subtype
+    ib = d.GetFieldIndex("b")
+    assert d.GetFieldDefn(ib).GetSubType() == ogr.OFSTBoolean
+    assert f["b"] == 1
 
 
 ###############################################################################
@@ -616,3 +628,124 @@ def test_ogr_geopbf_xyres_option(tmp_path):
     gdal.VectorTranslate(dst, src, options=gdal.VectorTranslateOptions(
         format="GeoPBF", xyRes="1e-7"))
     assert _file_precision(dst) == 7
+
+
+###############################################################################
+# Binary payloads. The bytes live in a dataset-level pool (BUFS) and features
+# only hold references into it, so the pool travels as dataset metadata and the
+# per-feature cost stays zero. data/geopbf/withbufs.geopbf was written by the
+# reference JavaScript implementation and holds a PNG blob plus an image shared
+# by two features.
+
+
+def test_ogr_geopbf_binary_pool_is_exposed():
+
+    ds = ogr.Open(os.path.join(DATA, "withbufs.geopbf"))
+    bufs = ds.GetMetadata("BUFS")
+    assert sorted(bufs.keys()) == ["0", "1"]
+
+    import base64
+
+    assert len(base64.b64decode(bufs["0"])) > 0
+
+    lyr = ds.GetLayer(0)
+    # the driver records which fields are references into the pool
+    kinds = lyr.GetMetadata("GEOPBF")
+    assert kinds == {"photo": "BLOB", "icon": "IMAGE"}
+
+    feats = [f for f in lyr]
+    assert feats[0]["photo"] == ":image/png:0"       # name:mime:id
+    assert feats[1]["icon"] == "2:2:1"               # width:height:id
+    assert feats[2]["icon"] == "2:2:1"               # the same buffer, shared
+
+
+def test_ogr_geopbf_binary_survives_conversion(tmp_path):
+
+    src = os.path.join(DATA, "withbufs.geopbf")
+    dst = str(tmp_path / "out.geopbf")
+    gdal.VectorTranslate(dst, src, format="GeoPBF")
+
+    a, b = ogr.Open(src), ogr.Open(dst)
+    assert a.GetMetadata("BUFS") == b.GetMetadata("BUFS"), "the binary pool was lost"
+    assert a.GetLayer(0).GetMetadata("GEOPBF") == b.GetLayer(0).GetMetadata("GEOPBF")
+
+    fa = [f["photo"] or f["icon"] for f in a.GetLayer(0)]
+    fb = [f["photo"] or f["icon"] for f in b.GetLayer(0)]
+    assert fa == fb, "the references into the pool were lost"
+
+
+def test_ogr_geopbf_values_precede_index(tmp_path):
+    """Field order is part of the format.
+
+    The reference reader collects VALUE messages as it walks the feature and
+    binds them when it reaches INDEX, so INDEX must come last. Writing it first
+    still round-trips through this driver — which collects both and then zips
+    them — but every attribute reads back empty in the reference implementation.
+    """
+
+    filename = str(tmp_path / "order.geopbf")
+    ds = ogr.GetDriverByName("GeoPBF").CreateDataSource(filename, options=["COMPRESS=NONE"])
+    lyr = ds.CreateLayer("o", geom_type=ogr.wkbPoint)
+    lyr.CreateField(ogr.FieldDefn("a", ogr.OFTString))
+    lyr.CreateField(ogr.FieldDefn("b", ogr.OFTInteger))
+    f = ogr.Feature(lyr.GetLayerDefn())
+    f.SetGeometry(ogr.CreateGeometryFromWkt("POINT (1 2)"))
+    f["a"] = "x"
+    f["b"] = 7
+    lyr.CreateFeature(f)
+    ds = None
+
+    data = open(filename, "rb").read()
+
+    def varint(i):
+        v = s = 0
+        while True:
+            byte = data[i]
+            i += 1
+            v |= (byte & 0x7F) << s
+            if not byte & 0x80:
+                return v, i
+            s += 7
+
+    # walk to FARRAY, then into the first FEATURE, recording the tag order
+    i = 0
+    feature_body = None
+    while i < len(data):
+        tag, i = varint(i)
+        field, wire = tag >> 3, tag & 7
+        if wire == 2:
+            ln, i = varint(i)
+            if field == 5:                      # FARRAY
+                j = i
+                tag2, j = varint(j)
+                ln2, j = varint(j)              # first FEATURE
+                feature_body = (j, j + ln2)
+                break
+            i += ln
+        elif wire == 0:
+            _, i = varint(i)
+        elif wire == 1:
+            i += 8
+        else:
+            break
+
+    assert feature_body is not None
+    i, end = feature_body
+    order = []
+    while i < end:
+        tag, i = varint(i)
+        field, wire = tag >> 3, tag & 7
+        order.append(field)
+        if wire == 2:
+            ln, i = varint(i)
+            i += ln
+        elif wire == 0:
+            _, i = varint(i)
+        elif wire == 1:
+            i += 8
+        else:
+            break
+
+    assert 11 in order and 12 in order, "expected VALUE (11) and INDEX (12)"
+    assert order.index(12) > max(k for k, v in enumerate(order) if v == 11), \
+        "INDEX must be written after every VALUE"

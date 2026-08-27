@@ -58,13 +58,72 @@ Attributes
 
 Attribute names form a dictionary in the file header; each feature stores the
 indices of the fields it sets, so sparsely populated attributes cost nothing.
+Names containing a dot express nesting in the reference implementation
+(``owner.name``); they are passed through unchanged as ordinary field names.
 
-On write, values are stored with their type: ``Integer`` and ``Integer64`` as
-zig-zag varints, ``Real`` as a double, ``Integer`` of subtype ``Boolean`` as a
-boolean, ``Date`` and ``DateTime`` as a Unix timestamp, and list fields as
-JSON. All other types are written as strings.
+Every value carries its own type on the wire, so field types are recovered on
+read rather than guessed from text:
 
-On read, every attribute is currently exposed as a field of type ``String``.
+===================  ==========================  ======================================
+GeoPBF value         OGR field                   Notes
+===================  ==========================  ======================================
+BOOL                 Integer, ``Boolean``
+INTEGER              Integer64                   zig-zag varint
+FLOAT                Real                        IEEE double
+STRING               String
+DATE                 DateTime                    Unix timestamp, exposed as UTC
+JSON                 String, ``JSON``
+BBOX                 RealList (4 values)
+COLOR                String                      ``rgb(r,g,b)`` / ``rgba(r,g,b,a)``
+FUNC                 String                      **never evaluated** — see below
+BLOB, IMAGE          String                      reference into the pool — see below
+===================  ==========================  ======================================
+
+Types are determined by inspecting features until every field has been seen, or
+until :oo:`TYPE_SCAN_FEATURES` features have been read. A field whose values
+disagree between features falls back to ``String``.
+
+.. warning::
+
+    A ``FUNC`` value holds JavaScript source. The reference implementation turns
+    it back into a callable; this driver never does, and exposes it as text.
+    Treat it as untrusted input.
+
+Binary payloads
+---------------
+
+Binary content (``BLOB`` for files, ``IMAGE`` for raw RGBA pixels) is not stored
+in the feature. The bytes live in a single dataset-level pool and each feature
+holds only a reference into it: ``name:mime:id`` for a blob, ``width:height:id``
+for an image. One icon shared by a million points is therefore stored once.
+
+That sharing has no equivalent in the OGR data model — a binary field would copy
+the payload into every feature — so the driver keeps the two apart:
+
+- the reference stays in the feature, as a ``String`` field;
+- the pool is exposed as the dataset metadata domain ``BUFS``, one base64 item
+  per buffer, keyed by the id the references use;
+- the layer metadata domain ``GEOPBF`` records which fields are references, and
+  whether each is a ``BLOB`` or an ``IMAGE``.
+
+Because ``ogr2ogr`` copies dataset and layer metadata by default, a GeoPBF to
+GeoPBF conversion keeps the payloads, the references and the sharing intact. Use
+``-nomd`` and the binary content is dropped.
+
+Reaching the bytes from a feature therefore takes one indirection: read the id
+out of the reference, then decode the matching item of the ``BUFS`` domain.
+Exposing them directly as ``Binary`` fields would duplicate shared payloads once
+per feature, and an ``IMAGE`` is raw RGBA rather than an encoded picture, so no
+tool would display it without re-encoding; that is left out deliberately.
+
+Field order
+-----------
+
+Within a feature, the ``VALUE`` messages are written before the ``INDEX`` that
+binds them to field names. The reference implementation collects values as it
+walks the feature and binds them when it reaches the index, so an index written
+first yields empty attributes there — even though a reader that gathers both
+before pairing them, including this driver, sees nothing wrong.
 
 Compression
 -----------
@@ -111,6 +170,19 @@ advertises :cpp:enumerator:`OLCFastFeatureCount`,
 :cpp:enumerator:`OLCFastGetExtent`, :cpp:enumerator:`OLCFastSpatialFilter` and
 :cpp:enumerator:`OLCRandomRead`. Feature identifiers are the zero-based position
 of the feature in the file.
+
+Open options
+------------
+
+|about-open-options|
+
+-  .. oo:: TYPE_SCAN_FEATURES
+      :choices: <int>
+      :default: 1000
+
+      How many features to inspect when determining field types. The scan stops
+      as soon as every field has been seen at least once, so this only matters
+      for files where some attribute appears late.
 
 Dataset creation options
 ------------------------

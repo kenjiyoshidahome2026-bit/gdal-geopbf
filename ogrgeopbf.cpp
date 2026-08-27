@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstdio>
 #include <ctime>
+#include "cpl_time.h"
 #include <algorithm>
 
 // ── Dataset ───────────────────────────────────────────────────────────────────
@@ -32,7 +33,8 @@ static bool GeoPBFIngest(VSILFILE* fp, std::vector<uint8_t>& out, vsi_l_offset n
     return n > 0;
 }
 
-int OGRGeoPBFDataset::Open(const char* pszFilename) {
+int OGRGeoPBFDataset::Open(const char* pszFilename, CSLConstList papszOpenOptions) {
+    m_nTypeScan = atoi(CSLFetchNameValueDef(papszOpenOptions, "TYPE_SCAN_FEATURES", "1000"));
     // gzip された .geopbf を透過的に読む。ウェブ側の書き出し（encoder）は gzip して .geopbf を吐き、
     // JS の読み手は gzip 印を見て自動で伸長する＝同じ物がドライバでも開けないと片翼になる。
     // 実装は GDAL の /vsigzip/ に委譲（自前 zlib を持たない＝依存ゼロの掟を守る）。
@@ -96,6 +98,17 @@ int OGRGeoPBFDataset::Open(const char* pszFilename) {
              osOpen != pszFilename ? " (gzip)" : "");
     if (!m_farrayPos) return FALSE;
     SetDescription(pszFilename);
+
+    // BUFS（バイナリのプール）はデータセットのメタデータ領域で運ぶ。地物ごとの値には
+    // 参照（"name:mime:id" / "w:h:id"）だけが入り、実体はここ一箇所＝共有関係が保たれ、
+    // 地物ごとのコストもゼロ。ogr2ogr がこれを複製することで GeoPBF→GeoPBF で中身が失われない。
+    for (size_t i = 0; i < m_bufs.size(); i++) {
+        char* pszB64 = CPLBase64Encode((int)m_bufs[i].size(), m_bufs[i].data());
+        SetMetadataItem(CPLSPrintf("%zu", i), pszB64, "BUFS");
+        CPLFree(pszB64);
+    }
+    if (!m_bufs.empty())
+        CPLDebug("GeoPBF", "%zu binary buffers exposed in the BUFS metadata domain", m_bufs.size());
     m_poLayer = new OGRGeoPBFLayer(this);
     return TRUE;
 }
@@ -119,9 +132,28 @@ OGRGeoPBFLayer::OGRGeoPBFLayer(OGRGeoPBFDataset* poDS)
     m_poFeatureDefn->GetGeomFieldDefn(0)->SetSpatialRef(poSRS);
     poSRS->Release();
 
-    for (const auto& key : poDS->m_keys) {
-        OGRFieldDefn f(key.c_str(), OFTString);
+    ScanFieldTypes();
+    for (size_t i = 0; i < poDS->m_keys.size(); i++) {
+        OGRFieldType eType = OFTString;
+        OGRFieldSubType eSub = OFSTNone;
+        switch (m_anKeyType[i]) {
+            case DT_BOOL:    eType = OFTInteger;   eSub = OFSTBoolean; break;
+            case DT_INTEGER: eType = OFTInteger64; break;   // svarint は 64bit
+            case DT_FLOAT:   eType = OFTReal;      break;
+            case DT_DATE:    eType = OFTDateTime;  break;
+            case DT_JSON:    eType = OFTString;    eSub = OFSTJSON; break;
+            case DT_BBOX:    eType = OFTRealList;  break;
+            default:         eType = OFTString;    break;   // STRING/COLOR/FUNC/BLOB/IMAGE/混在/未出現
+        }
+        OGRFieldDefn f(poDS->m_keys[i].c_str(), eType);
+        if (eSub != OFSTNone) f.SetSubType(eSub);
         m_poFeatureDefn->AddFieldDefn(&f);
+
+        // どのフィールドが BUFS を指す参照なのかを記録しておく。書き手はこれを見て
+        // BLOB/IMAGE として書き戻す＝ただの文字列に退化させない。
+        if (m_anKeyType[i] == DT_BLOB || m_anKeyType[i] == DT_IMAGE)
+            SetMetadataItem(poDS->m_keys[i].c_str(),
+                            m_anKeyType[i] == DT_BLOB ? "BLOB" : "IMAGE", "GEOPBF");
     }
 
     // ファイルの量子化幅を GDAL 標準の「座標解像度」として公開する。ogr2ogr はこれを自動で
@@ -145,12 +177,105 @@ void OGRGeoPBFLayer::ResetReading() {
     m_bUseCandidates = false;   // フィルタが差し替わっていれば次回作り直す
 }
 
-std::string OGRGeoPBFLayer::DecodeValue(PbfReader& msg) {
+// 値の型はワイヤ上に入っている＝どれか一つの地物が書いていれば型は判る。
+// 全キーの型が揃うか、上限（TYPE_SCAN_FEATURES）に達したら打ち切る＝疎な属性も取りこぼしにくい。
+void OGRGeoPBFLayer::ScanFieldTypes() {
+    const size_t nKeys = m_poDS->m_keys.size();
+    m_anKeyType.assign(nKeys, -1);
+    if (!nKeys) return;
+
+    const uint8_t* data = m_poDS->m_data.data();
+    const size_t   fend = m_poDS->m_farrayEnd;
+    size_t pos = m_poDS->m_farrayPos;
+    size_t nSeen = 0, nResolved = 0;
+    const int nLimit = m_poDS->m_nTypeScan > 0 ? m_poDS->m_nTypeScan : 1000;
+
+    while (pos < fend && (int)nSeen < nLimit && nResolved < nKeys) {
+        PbfReader r(data, pos, fend);
+        int wt; int tag = r.readTag(wt);
+        if (tag != TAG_FEATURE || wt != 2) { r.skipField(wt); pos = r.pos; continue; }
+        const size_t len = r.readVarint();
+        PbfReader feat(data, r.pos, r.pos + len);
+        pos = r.pos + len;
+        nSeen++;
+
+        std::vector<int> types;               // VALUE の出現順の型
+        std::vector<uint64_t> index;
+        while (!feat.atEnd()) {
+            int fwt; int ftag = feat.readTag(fwt);
+            if (ftag == TAG_VALUE && fwt == 2) {
+                auto vr = feat.enterMessage();
+                if (vr.atEnd()) { types.push_back(DT_NULL); continue; }
+                int vwt; const int dtype = vr.readTag(vwt);
+                types.push_back(dtype);
+            } else if (ftag == TAG_INDEX && fwt == 2) {
+                index = feat.readPackedVarint();
+            } else {
+                feat.skipField(fwt);
+            }
+        }
+        for (size_t i = 0; i < index.size() && i < types.size(); i++) {
+            const size_t k = (size_t)index[i];
+            if (k >= nKeys || types[i] == DT_NULL) continue;
+            if (m_anKeyType[k] == -1) { m_anKeyType[k] = types[i]; nResolved++; }
+            else if (m_anKeyType[k] != types[i]) m_anKeyType[k] = -2;   // 混在＝文字列へ落とす
+        }
+    }
+    CPLDebug("GeoPBF", "field types resolved from %zu features (%zu/%zu keys)", nSeen, nResolved, nKeys);
+}
+
+// ワイヤ上の値を、宣言した OGR フィールド型に合わせて入れる。
+// 型が食い違うキー（-2）は文字列欄なので、従来どおり文字列へ落とす。
+void OGRGeoPBFLayer::SetFieldFromValue(OGRFeature* poFeature, int iField, PbfReader& msg) {
+    const OGRFieldDefn* fd = m_poFeatureDefn->GetFieldDefn(iField);
+    if (msg.atEnd()) return;
+    const size_t nSave = msg.pos;
+    int wt; const int dtype = msg.readTag(wt);
+
+    switch (fd->GetType()) {
+        case OFTInteger:
+            if (dtype == DT_BOOL) { poFeature->SetField(iField, msg.readVarint() ? 1 : 0); return; }
+            break;
+        case OFTInteger64:
+            if (dtype == DT_INTEGER) { poFeature->SetField(iField, (GIntBig)msg.readSVarint()); return; }
+            break;
+        case OFTReal:
+            if (dtype == DT_FLOAT) { poFeature->SetField(iField, msg.readDouble()); return; }
+            break;
+        case OFTDateTime:
+            if (dtype == DT_DATE) {
+                struct tm brokendown;
+                CPLUnixTimeToYMDHMS((GIntBig)msg.readSVarint(), &brokendown);
+                poFeature->SetField(iField, brokendown.tm_year + 1900, brokendown.tm_mon + 1,
+                                    brokendown.tm_mday, brokendown.tm_hour, brokendown.tm_min,
+                                    (float)brokendown.tm_sec, 100 /* UTC */);
+                return;
+            }
+            break;
+        case OFTRealList:
+            if (dtype == DT_BBOX && wt == 2) {
+                const size_t len = msg.readVarint(), nEnd = msg.pos + len;
+                std::vector<double> v;
+                while (msg.pos + 8 <= nEnd) v.push_back(msg.readDouble());
+                if (!v.empty()) poFeature->SetField(iField, (int)v.size(), v.data());
+                return;
+            }
+            break;
+        default: break;
+    }
+    msg.pos = nSave;                                     // 想定と違う型＝文字列に落とす
+    const std::string s = DecodeValueAsString(msg);
+    if (!s.empty()) poFeature->SetField(iField, s.c_str());
+}
+
+std::string OGRGeoPBFLayer::DecodeValueAsString(PbfReader& msg) {
     if (msg.atEnd()) return "";
     int wt; int dtype = msg.readTag(wt);
     char buf[64];
     switch (dtype) {
-        case DT_STRING: case DT_JSON: case DT_FUNC: {
+        // BLOB="name:mime:id" / IMAGE="w:h:id"＝どちらもワイヤ上は文字列。
+        // 実体は BUFS プール（データセットのメタデータ領域）にあり、この id が指す。
+        case DT_STRING: case DT_JSON: case DT_FUNC: case DT_BLOB: case DT_IMAGE: {
             size_t len = msg.readVarint(); return msg.readString(len);
         }
         case DT_FLOAT: {
@@ -370,7 +495,7 @@ OGRFeature* OGRGeoPBFLayer::FeatureFromRecord(const FeatRec& rec, GIntBig nFID) 
     OGRFeature* poFeature = new OGRFeature(m_poFeatureDefn);
     poFeature->SetFID(nFID);
 
-    std::vector<std::string> values;
+    std::vector<std::pair<size_t, size_t>> values;   // VALUE 本体のバイト範囲（出現順）
     std::vector<uint64_t>    index;
     OGRGeometry* geom = nullptr;
 
@@ -380,8 +505,9 @@ OGRFeature* OGRGeoPBFLayer::FeatureFromRecord(const FeatRec& rec, GIntBig nFID) 
             auto gr = feat.enterMessage();
             geom = DecodeGeometry(gr);
         } else if (ftag == TAG_VALUE && fwt == 2) {
-            auto vr = feat.enterMessage();
-            values.push_back(DecodeValue(vr));
+            const size_t len = feat.readVarint();
+            values.emplace_back(feat.pos, feat.pos + len);
+            feat.pos += len;
         } else if (ftag == TAG_INDEX && fwt == 2) {
             index = feat.readPackedVarint();
         } else {
@@ -390,8 +516,9 @@ OGRFeature* OGRGeoPBFLayer::FeatureFromRecord(const FeatRec& rec, GIntBig nFID) 
     }
     for (size_t i = 0; i < index.size() && i < values.size(); i++) {
         const int fi = (int)index[i];
-        if (fi < m_poFeatureDefn->GetFieldCount() && !values[i].empty())
-            poFeature->SetField(fi, values[i].c_str());
+        if (fi < 0 || fi >= m_poFeatureDefn->GetFieldCount()) continue;
+        PbfReader vr(m_poDS->m_data.data(), values[i].first, values[i].second);
+        SetFieldFromValue(poFeature, fi, vr);
     }
     if (geom) {
         geom->assignSpatialReference(m_poFeatureDefn->GetGeomFieldDefn(0)->GetSpatialRef());
@@ -608,7 +735,7 @@ static int OGRGeoPBFDriverIdentify(GDALOpenInfo* poOpenInfo) {
 static GDALDataset* OGRGeoPBFDriverOpen(GDALOpenInfo* poOpenInfo) {
     if (!OGRGeoPBFDriverIdentify(poOpenInfo)) return nullptr;
     auto* poDS = new OGRGeoPBFDataset();
-    if (!poDS->Open(poOpenInfo->pszFilename)) { delete poDS; return nullptr; }
+    if (!poDS->Open(poOpenInfo->pszFilename, poOpenInfo->papszOpenOptions)) { delete poDS; return nullptr; }
     return poDS;
 }
 
@@ -636,6 +763,12 @@ void CPL_DLL GDALRegister_GeoPBF() {
                        "Integer Integer64 Real String Date DateTime "
                        "IntegerList Integer64List RealList StringList");
     d->SetMetadataItem(GDAL_DMD_CREATIONFIELDDATASUBTYPES, "Boolean");
+    d->SetMetadataItem(GDAL_DMD_OPENOPTIONLIST,
+        "<OpenOptionList>"
+        "  <Option name='TYPE_SCAN_FEATURES' type='int' default='1000' "
+        "description='How many features to inspect to determine field types. "
+        "Scanning stops early once every field has been seen.'/>"
+        "</OpenOptionList>");
     d->SetMetadataItem(GDAL_DMD_CREATIONOPTIONLIST,
         "<CreationOptionList>"
         "  <Option name='PRECISION' type='int' min='0' max='9' default='6' "
