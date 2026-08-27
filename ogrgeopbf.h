@@ -223,12 +223,7 @@ public:
     int         TestCapability(const char* pszCap) const override;
     OGRErr      CreateField(const OGRFieldDefn* poField, int bApproxOK = TRUE) override;
     OGRErr      ICreateFeature(OGRFeature* poFeature) override;
-    // ogr2ogr が複製してくる元レイヤのメタデータから PRECISION を受け取る
-    // （作成オプションで明示された場合はそちらが勝つ）
-    CPLErr      SetMetadataItem(const char* pszName, const char* pszValue,
-                                const char* pszDomain = "") override;
-    CPLErr      SetMetadata(GEOPBF_METADATA_LIST papszMetadata, const char* pszDomain = "") override;
-    double      Scale() const { return m_dfScale; }
+    double      Scale() const { return m_dfScale; }   // 実際に符号化へ使う量子化幅
 
     const std::vector<std::string>&          Keys()     const { return m_keys; }
     const std::vector<std::vector<uint8_t>>& Features() const { return m_features; }

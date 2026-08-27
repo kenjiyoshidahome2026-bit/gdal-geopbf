@@ -106,7 +106,8 @@ Window query returning 460 features    1.2 ms
 Full scan of all features            1 010 ms
 ==================================  ==========
 
-The layer advertises :cpp:enumerator:`OLCFastFeatureCount`,
+The driver advertises ``DCAP_HONOR_GEOM_COORDINATE_PRECISION``, and the layer
+advertises :cpp:enumerator:`OLCFastFeatureCount`,
 :cpp:enumerator:`OLCFastGetExtent`, :cpp:enumerator:`OLCFastSpatialFilter` and
 :cpp:enumerator:`OLCRandomRead`. Feature identifiers are the zero-based position
 of the feature in the file.
@@ -137,10 +138,14 @@ The following dataset creation options are available:
       is about 11 cm, 7 is about 1.1 cm. Lowering it produces smaller files at a
       coarser resolution.
 
-      When the source layer carries a ``PRECISION`` metadata item — which this
-      driver sets when reading a GeoPBF file, and which ``ogr2ogr`` copies by
-      default — that value is inherited, so converting GeoPBF to GeoPBF does not
-      quietly coarsen coordinates. An explicit creation option always wins.
+      When not given, the value is taken from the coordinate resolution declared
+      by the source layer, through the standard OGR mechanism
+      (:cpp:class:`OGRGeomCoordinatePrecision`). This driver publishes the file's
+      quantisation as that resolution on read and honours it on write, so a
+      conversion never quietly coarsens coordinates — including through an
+      intermediate format that carries the resolution, such as GeoPackage.
+      ``ogr2ogr -xyRes`` overrides the inherited value, and an explicit
+      :dsco:`PRECISION` creation option overrides everything.
 
 Examples
 --------

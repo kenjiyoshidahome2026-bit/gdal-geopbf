@@ -10,6 +10,9 @@ GeoPBF is a compact binary vector format based on Protocol Buffers with delta-en
 - **Gzipped `.geopbf` is read transparently** (memory use follows the decompressed size) — files exported from web tooling are gzip-compressed; the driver detects the gzip signature and reads them through GDAL's `/vsigzip/` (no zlib dependency added)
 - **Content-based `Identify()`** — files are recognised by their header signature, not only by the `.geopbf` extension
 - Zero external dependencies — self-contained Protobuf reader and writer
+- Coordinate precision is carried through conversions (the file's quantisation is
+  published as the layer's coordinate resolution), so a round trip never silently
+  coarsens coordinates
 - In-memory spatial index built on demand: window queries stay fast on large
   layers (500 k points: 1.2 ms for a 460-feature window, versus 276 ms without it)
 - Supports all GeoPBF geometry types: Point, MultiPoint, LineString, MultiLineString, Polygon, MultiPolygon, GeometryCollection

@@ -124,8 +124,15 @@ OGRGeoPBFLayer::OGRGeoPBFLayer(OGRGeoPBFDataset* poDS)
         m_poFeatureDefn->AddFieldDefn(&f);
     }
 
-    // ファイルの PRECISION をメタデータで公開する。ogr2ogr は既定でレイヤのメタデータを
-    // 複製するので、GeoPBF→GeoPBF の変換で桁が黙って落ちなくなる（筆界データで 1e-7→1e-6 は 1.1cm→11cm）。
+    // ファイルの量子化幅を GDAL 標準の「座標解像度」として公開する。ogr2ogr はこれを自動で
+    // 引き継ぎ、-xyRes でも上書きできる＝GeoPBF→GeoPBF で桁が黙って落ちない
+    // （筆界データの 1e-7→1e-6 は 1.1cm→11cm の劣化）。他形式からの変換でも、
+    // 元が解像度を宣言していれば（GeoPackage 等）そのまま効く。
+    OGRGeomCoordinatePrecision oPrec;
+    oPrec.dfXYResolution = 1.0 / poDS->m_scale;
+    m_poFeatureDefn->GetGeomFieldDefn(0)->SetCoordinatePrecision(oPrec);
+    // 参考情報（人が ogrinfo で確認する用）。引き継ぎは上の座標解像度が担うので、
+    // 書き手はこのメタデータを見ない＝二つの経路が競合しない。
     SetMetadataItem("PRECISION", CPLSPrintf("%d", (int)std::lround(std::log10(poDS->m_scale))));
 }
 
@@ -622,6 +629,9 @@ void CPL_DLL GDALRegister_GeoPBF() {
     d->SetMetadataItem(GDAL_DCAP_VIRTUALIO,  "YES");
     d->SetMetadataItem(GDAL_DCAP_CREATE_LAYER, "YES");
     d->SetMetadataItem(GDAL_DCAP_CREATE_FIELD, "YES");
+    // 座標解像度を自分で受け止める＝ogr2ogr は -xyRes と元レイヤの宣言をドライバへ渡す
+    // （宣言しないと ogr2ogr 側が丸めてから渡すだけになり、ファイルの PRECISION は既定のままになる）
+    d->SetMetadataItem(GDAL_DCAP_HONOR_GEOM_COORDINATE_PRECISION, "YES");
     d->SetMetadataItem(GDAL_DMD_CREATIONFIELDDATATYPES,
                        "Integer Integer64 Real String Date DateTime "
                        "IntegerList Integer64List RealList StringList");

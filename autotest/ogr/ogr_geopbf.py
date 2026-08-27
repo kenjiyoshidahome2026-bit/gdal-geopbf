@@ -593,3 +593,26 @@ def test_ogr_geopbf_precision_option_wins(tmp_path):
 
     gdal.VectorTranslate(dst, src, format="GeoPBF", datasetCreationOptions=["PRECISION=3"])
     assert _file_precision(dst) == 3
+
+
+def test_ogr_geopbf_coordinate_precision_is_exposed(tmp_path):
+    """The quantisation step is published through the standard OGR mechanism."""
+
+    p7 = str(tmp_path / "p7.geopbf")
+    _make(p7, 7)
+
+    ds = ogr.Open(p7)
+    prec = ds.GetLayer(0).GetLayerDefn().GetGeomFieldDefn(0).GetCoordinatePrecision()
+    assert prec.GetXYResolution() == pytest.approx(1e-7)
+
+
+def test_ogr_geopbf_xyres_option(tmp_path):
+    """ogr2ogr -xyRes must drive the stored precision."""
+
+    src = str(tmp_path / "src6.geopbf")
+    dst = str(tmp_path / "dst7.geopbf")
+    _make(src, 6)
+
+    gdal.VectorTranslate(dst, src, options=gdal.VectorTranslateOptions(
+        format="GeoPBF", xyRes="1e-7"))
+    assert _file_precision(dst) == 7

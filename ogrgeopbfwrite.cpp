@@ -88,25 +88,6 @@ OGRGeoPBFWriteLayer::OGRGeoPBFWriteLayer(const char* pszName, const OGRSpatialRe
 
 OGRGeoPBFWriteLayer::~OGRGeoPBFWriteLayer() { m_poFeatureDefn->Release(); }
 
-// 元が GeoPBF なら、その PRECISION をそのまま引き継ぐ（黙って桁を落とさない）。
-// -dsco PRECISION= が明示されていればそちらが勝つ。地物を書き始めた後は変えない。
-CPLErr OGRGeoPBFWriteLayer::SetMetadataItem(const char* pszName, const char* pszValue,
-                                            const char* pszDomain) {
-    if (pszName && pszValue && EQUAL(pszName, "PRECISION") &&
-        (pszDomain == nullptr || pszDomain[0] == '\0') &&
-        !m_bScaleFromOption && m_features.empty()) {
-        const int n = atoi(pszValue);
-        if (n >= 0 && n <= 9) m_dfScale = std::pow(10.0, n);
-    }
-    return OGRLayer::SetMetadataItem(pszName, pszValue, pszDomain);
-}
-
-CPLErr OGRGeoPBFWriteLayer::SetMetadata(GEOPBF_METADATA_LIST papszMetadata, const char* pszDomain) {
-    const char* pszPrec = CSLFetchNameValue(papszMetadata, "PRECISION");
-    if (pszPrec) SetMetadataItem("PRECISION", pszPrec, pszDomain);
-    return OGRLayer::SetMetadata(papszMetadata, pszDomain);
-}
-
 int OGRGeoPBFWriteLayer::TestCapability(const char* pszCap) const {
     if (EQUAL(pszCap, OLCSequentialWrite)) return TRUE;
     if (EQUAL(pszCap, OLCCreateField))     return TRUE;
@@ -330,7 +311,19 @@ OGRLayer* OGRGeoPBFWriteDataset::ICreateLayer(const char* pszName,
     }
     const OGRSpatialReference* poSRS = poGeomFieldDefn ? poGeomFieldDefn->GetSpatialRef() : nullptr;
     const OGRwkbGeometryType eGType = poGeomFieldDefn ? poGeomFieldDefn->GetType() : wkbUnknown;
-    m_poLayer = new OGRGeoPBFWriteLayer(pszName, poSRS, eGType, m_dfScale, m_bScaleFromOption);
+
+    // 元レイヤが座標解像度を宣言していれば、それに合わせて量子化幅を決める（GDAL 標準の経路）。
+    // -dsco PRECISION= の明示があればそちらが勝つ。0.5 桁以上ずれる解像度は近い桁へ丸める。
+    double dfScale = m_dfScale;
+    if (!m_bScaleFromOption && poGeomFieldDefn) {
+        const double dfRes = poGeomFieldDefn->GetCoordinatePrecision().dfXYResolution;
+        CPLDebug("GeoPBF", "inheriting XY resolution %.3g from the source layer", dfRes);
+        if (dfRes > 0) {
+            const int n = (int)std::lround(-std::log10(dfRes));
+            if (n >= 0 && n <= 9) dfScale = std::pow(10.0, n);
+        }
+    }
+    m_poLayer = new OGRGeoPBFWriteLayer(pszName, poSRS, eGType, dfScale, m_bScaleFromOption);
     return m_poLayer;
 }
 
